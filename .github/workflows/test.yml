@@ -1,0 +1,67 @@
+name: tests
+
+# Every pull request, and main itself so a merge is never the first time the
+# whole thing has run together.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A second push to a branch makes the first run's answer worthless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      # One version failing is a fact worth having about the others, so let them
+      # all finish rather than cancelling the matrix at the first red.
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+
+    name: ${{ matrix.python }}
+
+    # 3.15 was here, and came back out. It could only fail — psycopg publishes a
+    # wheel per interpreter and there is no cp315 one yet — so every pull request
+    # carried a red check that meant nothing about dray, which is how a team
+    # learns to read past red checks. Worth adding again once that wheel exists,
+    # with `continue-on-error` so it reports without blocking.
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # `pytest-postgresql` starts a server of its own and throws it away —
+      # that is the point of it, and it is what the suite runs on. So this needs
+      # the server binaries on PATH rather than a database to connect to, and
+      # the runner image already ships them somewhere PATH does not reach.
+      #
+      # Globbed rather than pinned to a version, because the image moves and a
+      # hardcoded `16` would fail on the day it does. Loudly if it is ever
+      # missing altogether, since a silent fallback here would mean the suite
+      # quietly testing nothing.
+      - name: Put PostgreSQL's server binaries on PATH
+        run: |
+          bin=$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1)
+          if [ -z "$bin" ]; then
+            echo "No PostgreSQL server binaries on this image." >&2
+            exit 1
+          fi
+          echo "Using $bin"
+          "$bin/postgres" --version
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - uses: astral-sh/setup-uv@v10.0.0
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+
+      # Both have to be named. `test` is not a default group, so a bare
+      # `uv run pytest` resolves a pytest that has never heard of dray and
+      # passes without running any of this — and `psycopg_pool` lives in the
+      # `dsql` extra, which `tests/test_pooling.py` imports at module scope, so
+      # without it the suite cannot even be collected.
+      - name: Run the suite
+        run: uv run --group test --extra dsql pytest tests -q

@@ -1,0 +1,83 @@
+[project]
+name = "dray"
+version = "0.1"
+description = "A Python record layer for Amazon Aurora DSQL"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "Rodos" }]
+license = "MIT"
+license-files = ["LICENSE"]
+# What PyPI shows in its sidebar and what people filter on. No licence
+# classifier: `license = "MIT"` above is the SPDX expression that replaced it,
+# and saying both is how the two come to disagree.
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Database :: Front-Ends",
+    "Operating System :: OS Independent",
+    "Typing :: Typed",
+]
+dependencies = [
+    "psycopg>=3.3.4",
+    # The read cache's expiry and its size limit. Hand-rolling those is a day's
+    # work and a decade of corner cases, and `functools.lru_cache` cannot do
+    # either — no lifetime, and no way to drop a single key, which is the whole
+    # of what makes dray's cache safe.
+    "cachetools>=5.3",
+]
+
+# `Store.connect` authenticates against a cluster and so needs AWS's own
+# connector; a store handed a connection you already have does not, which is why
+# this is not a dependency.
+[project.optional-dependencies]
+dsql = [
+    # The connector's own `psycopg` extra, rather than the bare package, because
+    # it is what asks for `psycopg[binary]` — psycopg on its own is the Python
+    # half and finds libpq or does not, so a machine without one installs all of
+    # this cleanly and then cannot `import dray` at all. Taking the extra means
+    # the answer to that is upstream's to keep right rather than ours to copy.
+    #
+    # Pinned under 0.3 because it is pre-1.0 and AWS may move the API in a
+    # minor. An unpinned pre-1.0 dependency is a release that breaks on a day
+    # nobody here touched anything.
+    "aurora-dsql-python-connector[psycopg]>=0.2.7,<0.3",
+    # Named here as well as by the connector's extra because `dray.Pool` imports
+    # it directly. What a package imports it declares, whatever a dependency
+    # happens to bring along.
+    "psycopg-pool>=3.3.1",
+]
+
+# PyPI shows these in its sidebar and they are the only navigation a page there
+# has. Homepage and Source are the same repository deliberately: there is no
+# separate site to send anybody to, and an entry pointing at one that does not
+# exist is worse than the one that is missing.
+[project.urls]
+Homepage = "https://github.com/draylabs/dray"
+Documentation = "https://github.com/draylabs/dray/blob/main/docs/manual.md"
+Source = "https://github.com/draylabs/dray"
+Issues = "https://github.com/draylabs/dray/issues"
+
+[dependency-groups]
+test = [
+    "pytest",
+    "pytest-xdist",
+    "pytest-postgresql",
+    "psycopg[binary]",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    # Needs a real cluster, and is skipped without one. `tests/test_compatibility.py`
+    # otherwise runs against local PostgreSQL like everything else, so it can be
+    # debugged before it is believed.
+    "dsql: only answerable by Aurora DSQL",
+]
+
+[build-system]
+requires = ["uv_build>=0.12,<0.13"]
+build-backend = "uv_build"

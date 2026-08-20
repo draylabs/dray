@@ -1,0 +1,305 @@
+<!doctype html>
+<meta charset="utf-8"><title>dray — the reference</title>
+<style>
+  :root { --line: #e7ebef; --soft: #f1f4f6; }
+  * { box-sizing: border-box; }
+  body { font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, sans-serif;
+         margin: 0; background: #fbfbfa; color: #1c1c1a; }
+  .wrap { max-width: 90rem; margin: 0 auto; padding: 2.5rem 2rem 5rem; }
+  h1 { font-size: 1.7rem; font-weight: 640; margin: 0 0 .4rem; }
+  h2 { font-size: 1.15rem; font-weight: 640; margin: 0 0 .3rem; }
+  h3 { font-size: .98rem; font-weight: 620; margin: 2.2rem 0 .3rem; }
+  .sub { opacity: .62; margin: 0 0 1rem; max-width: 62rem; }
+  .lead { opacity: .62; margin: 0 0 1.2rem; max-width: 62rem;
+          font-size: .88rem; }
+  code { font: 12.5px ui-monospace, Menlo, monospace; }
+  section.part { padding: 2.6rem 0 0; }
+  section.part + section.part { border-top: 1px solid var(--line);
+                                margin-top: 3rem; }
+  nav { display: flex; gap: 1.2rem; font-size: .82rem; margin: 1.4rem 0 0;
+        padding-bottom: 1.6rem; border-bottom: 1px solid var(--line); }
+  nav a { color: #2d6a9f; text-decoration: none; }
+  nav a:hover { text-decoration: underline; }
+
+  /* the structure diagram and the walk beside it */
+  .pair { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1.05fr);
+          gap: 1rem; margin-bottom: 1.6rem; align-items: stretch; }
+  @media (max-width: 62rem) { .pair { grid-template-columns: 1fr; } }
+  .shape { background: #fff; border: 1px solid var(--line); border-radius: 12px;
+           padding: 1.4rem; overflow-x: auto;
+           display: flex; justify-content: center; align-items: center; }
+  .shape svg { max-width: 32rem !important; width: 100% !important;
+               height: auto; }
+  .walk { background: #fff; border: 1px solid var(--line); border-radius: 12px;
+          padding: 1.5rem 1.4rem; font-size: 12.5px; line-height: 1.9; }
+  .wl { display: flex; align-items: baseline; gap: .55rem; white-space: nowrap; }
+  .wd { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 7px;
+        transform: translateY(-1px); }
+  .wg { font-size: 11px; opacity: .72; margin-left: .7rem;
+        font-family: ui-sans-serif, system-ui, sans-serif; }
+  .wc { white-space: normal; margin-top: .5rem; }
+  .wc code { color: #7b848d; font-style: italic; line-height: 1.6; }
+
+  /* the member cards */
+  .cols { display: grid; gap: 1rem; align-items: start;
+          grid-template-columns: repeat(5, minmax(0, 1fr)); }
+  @media (max-width: 82rem) { .cols { grid-template-columns: repeat(3, 1fr); } }
+  @media (max-width: 54rem) { .cols { grid-template-columns: repeat(2, 1fr); } }
+  .card { background: #fff; border: 1px solid var(--line); border-radius: 12px;
+          padding: 1.1rem 1.2rem 1.3rem; border-top: 3px solid var(--accent); }
+  .card h2 { font: 600 14px ui-monospace, Menlo, monospace; margin: 0 0 .2rem;
+             color: var(--accent); }
+  .cs { font-size: .78rem; opacity: .6; margin: 0 0 .9rem; line-height: 1.45; }
+  .g { font-size: .68rem; text-transform: uppercase; letter-spacing: .06em;
+       opacity: .45; margin: .95rem 0 .35rem; font-weight: 600; }
+  .gn { font-size: .74rem; opacity: .55; margin: 0 0 .5rem; line-height: 1.4; }
+  .gn code { font-size: 11.5px; }
+  .m { display: flex; gap: .6rem; align-items: baseline;
+       padding: .17rem 0; border-bottom: 1px solid #f2f4f6; }
+  .m code { font: 12.5px ui-monospace, Menlo, monospace; font-weight: 600;
+            white-space: nowrap; }
+  .m span { font-size: .74rem; opacity: .58; line-height: 1.35; }
+  .decs { margin-top: 2rem; }
+  .panel { background: #fff; border: 1px solid var(--line);
+           border-radius: 12px; padding: 1.2rem 1.4rem; }
+  .panel .dec:last-child { border-bottom: none; padding-bottom: 0; }
+  .dec { display: grid; grid-template-columns: 8.5rem 1fr; gap: .8rem;
+         padding: .5rem 0; border-bottom: 1px solid #eceff2;
+         align-items: baseline; }
+  .dec code:first-child { font-weight: 600; color: #7d3cb5; }
+  .dec .what { font-size: .82rem; }
+  .dec .args { font-size: .72rem; opacity: .5; display: block;
+               margin-top: .15rem; }
+  .dec3 { grid-template-columns: 8.5rem minmax(0,1fr) 22rem; }
+  .pair2 { display: grid; grid-template-columns: minmax(0,1fr) 27rem;
+           gap: 2rem; align-items: start; }
+  @media (max-width: 68rem) { .pair2 { grid-template-columns: 1fr; }
+                              .dec3 { grid-template-columns: 8.5rem 1fr; } }
+  .ex { margin: 0; padding: .1rem 0 0;
+        font: 10.5px/1.65 ui-monospace, Menlo, monospace; color: #7a848e;
+        white-space: pre; }
+  .ex b { color: #7d3cb5; font-weight: 700; }
+  .ex.small { padding: .5rem 0; line-height: 1.5; }
+
+  /* the grids */
+  table { border-collapse: collapse; width: 100%; background: #fff;
+          border: 1px solid var(--line); border-radius: 12px; }
+  th, td { padding: 0; }
+  thead th { vertical-align: bottom; padding: 1.1rem .5rem .9rem;
+             border-bottom: 1px solid var(--line); }
+  .grp th { font-size: 10px; text-transform: uppercase; letter-spacing: .09em;
+            font-weight: 700; opacity: .45; padding: .9rem .5rem .1rem;
+            border-bottom: none; text-align: center; }
+  .grp th[colspan] { border-bottom: 2px solid var(--soft);
+                     padding-bottom: .4rem; }
+  .dh span:first-child { display: block;
+                         font: 600 12px ui-monospace, Menlo, monospace; }
+  .dw { display: block; font-size: 10.5px; opacity: .5; margin-top: .2rem; }
+  tbody th { text-align: left; padding: .55rem 1.1rem .55rem 1.2rem;
+             vertical-align: middle; max-width: 15rem; }
+  .sn { display: block; font: 600 12.5px ui-monospace, Menlo, monospace;
+        line-height: 1.4; }
+  .sw { display: block; font-size: 10.5px; opacity: .52; line-height: 1.4;
+        white-space: normal; }
+  .cell { position: relative; height: 3.05rem; display: flex;
+          align-items: center; justify-content: center; }
+  .rail { position: absolute; top: 0; bottom: 50%; width: 2px; }
+  .dot { font-size: 15px; position: relative; z-index: 1; background: #fff;
+         padding: 0 .35rem; }
+  td.code { padding: .35rem 1rem .35rem 1.3rem; border-left: 1px solid var(--soft);
+            vertical-align: middle; width: 23rem; }
+  td.code pre { margin: 0; font: 10.5px/1.5 ui-monospace, Menlo, monospace;
+                color: #7a848e; white-space: pre; }
+  td.code b { color: #1c2126; font-weight: 700; }
+  .tag { font-size: 10px; text-transform: uppercase; letter-spacing: .07em;
+         font-weight: 700; border: 1px solid; border-radius: 4px;
+         padding: .1rem .4rem; white-space: nowrap; }
+  td.res { padding: .55rem 1.2rem; }
+  td.res b { display: block; font: 600 11.5px ui-monospace, Menlo, monospace; }
+  td.res span { display: block; font-size: 10.5px; opacity: .55;
+                margin-top: .15rem; }
+  tbody tr + tr th, tbody tr + tr td { border-top: 1px solid var(--soft); }
+  .key { margin-top: 1rem; font-size: .78rem; opacity: .7; display: flex;
+         gap: 1.4rem; flex-wrap: wrap; }
+  .ws { display: grid; gap: 1rem; margin-top: 2.2rem;
+        grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); }
+  .w { background: #fff; border: 1px solid var(--line); border-radius: 10px;
+       padding: .9rem 1rem; }
+  .w b { font-size: .82rem; }
+  .w p { font-size: .78rem; opacity: .68; margin: .3rem 0 0; line-height: 1.5; }
+  #tx tbody th { max-width: none; width: 17rem; }
+  #tx .sw { white-space: normal; }
+  td.tx { padding: .7rem 1.2rem; vertical-align: top; }
+  td.tx b { display: block; font-size: 12.5px; font-weight: 600; }
+  td.tx span { display: block; font-size: 10.5px; opacity: .58;
+               margin-top: .18rem; line-height: 1.45; }
+</style>
+<div class="wrap">
+
+<h1>dray, at a glance</h1>
+<p class="sub">The two things the page says across a dozen paragraphs and never
+assembles: what the pieces are and how you get between them, and which door
+runs what. One <code>Person</code> throughout.</p>
+<nav>
+  <a href="#pieces">the pieces</a>
+  <a href="#offers">what each offers</a>
+  <a href="#doors">every door, and what it runs</a>
+  <a href="#tx">where the transaction is</a>
+  <a href="#names">what one assignment does</a>
+</nav>
+
+<section class="part" id="pieces">
+<h2>How you get from one to another</h2>
+<p class="lead">A child is a record — it keeps everything a record has and gains
+two columns naming its parent. What differs is the door: a child set is reached
+through one record and every read it does is scoped to that record, where a
+collection is reached through the store and is not.</p>
+<div class="pair">
+<pre class="mermaid shape">flowchart TD
+    PL(["a pool<br/><i>connections, retired before DSQL closes them</i>"])
+    S(["a store<br/><i>one connection, one thread</i>"])
+
+    PC["store.people<br/><b>a collection</b>"]
+    P["Person<br/><b>a record</b>"]
+    NS["person.notes<br/><b>a child set</b><br/><i>scoped to this person</i>"]
+    N["Note<br/><b>a child — which is a record</b><br/><i>plus parent_type, parent_id</i>"]
+    NC["store.notes<br/><b>a collection</b><br/><i>only with collection=</i>"]
+
+    PL -->|"with pool.store() as store<br/><i>one per request</i>"| S
+    S -->|"the records it was told about"| PC
+    PC -->|"add · find · by_id · save · delete"| P
+    P -->|"@child(of=Person, name='notes')"| NS
+    NS -->|"add queues · clear removes · find reads"| N
+    S -.->|"a second door, unscoped"| NC
+    NC -->|"add(note, parent=person) · find(parent=person)"| N
+    N -.->|"has everything a record has:<br/>save · delete · parse · as_dict · its own @check"| P
+
+    classDef pool fill:#f7f4ea,stroke:#8a7534,color:#332b0f
+    classDef store fill:#eef0f2,stroke:#5b6169,color:#22262b
+    classDef coll fill:#fdf3e6,stroke:#a8620a,color:#3d2405
+    classDef rec fill:#e8eef5,stroke:#2d6a9f,color:#12263a
+    classDef kid fill:#e9f5ef,stroke:#1a7f5a,color:#0d3625
+
+    class PL pool
+    class S store
+    class PC,NC coll
+    class P rec
+    class NS,N kid
+</pre>
+<div class="walk"><div class="wl"><span class="wd" style="background:#8a7534"></span><code>pool&nbsp;=&nbsp;dray.Pool(host="…")</code><span class="wg" style="color:#8a7534">a pool</span></div><div class="wl">&nbsp;</div><div class="wl"><span class="wd" style="background:#5b6169"></span><code>with&nbsp;pool.store()&nbsp;as&nbsp;store:</code><span class="wg" style="color:#5b6169">a store, for this request</span></div><div class="wl">&nbsp;</div><div class="wl wc"><code># Add a person and a note about them, in one transaction.</code></div><div class="wl"><span class="wd" style="background:#2d6a9f"></span><code>&nbsp;&nbsp;&nbsp;&nbsp;person&nbsp;=&nbsp;Person(family_name="…")</code><span class="wg" style="color:#2d6a9f">a record — in memory</span></div><div class="wl"><span class="wd" style="background:#1a7f5a"></span><code>&nbsp;&nbsp;&nbsp;&nbsp;person.notes.add("Called&nbsp;back.")</code><span class="wg" style="color:#1a7f5a">a child set — queued</span></div><div class="wl"><span class="wd" style="background:#a8620a"></span><code>&nbsp;&nbsp;&nbsp;&nbsp;store.people.add(person)</code><span class="wg" style="color:#a8620a">a collection — both rows</span></div><div class="wl">&nbsp;</div><div class="wl wc"><code># Ask about notes themselves, across every person — which a child set cannot, being scoped to one.</code></div><div class="wl"><span class="wd" style="background:#a8620a"></span><code>&nbsp;&nbsp;&nbsp;&nbsp;store.notes.since(a_week_ago)</code><span class="wg" style="color:#a8620a">the second door</span></div></div>
+</div>
+</section>
+
+<section class="part" id="offers">
+<h2>What each one offers</h2>
+<div class="cols" style="margin-top: 1.2rem">
+<section class="card" style="--accent:#8a7534"><h2>a pool</h2><p class="cs">How an application gets a store. Retires connections before DSQL closes them at an hour.</p><div class="g">one each, cheaply</div><div class="m"><code>store</code><span>a store for this request, given back at the end</span></div><div class="g">what every store on it shares</div><div class="m"><code>forget_all</code><span>drop every cached row, of every kind — for the process that has written past dray</span></div><div class="g">what it is</div><div class="m"><code>opened</code><span>how many connections are live</span></div><div class="m"><code>close</code><span>give the connection back</span></div></section>
+<section class="card" style="--accent:#5b6169"><h2>a store</h2><p class="cs">One connection and one thread, and the records it was told about.</p><div class="g">getting one</div><div class="m"><code>connect</code><span>make a store, with the IAM handshake</span></div><div class="m"><code>close</code><span>give the connection back</span></div><div class="g">schema</div><div class="m"><code>create</code><span>the tables these records imply</span></div><div class="g">transactions</div><div class="m"><code>transaction</code><span>a block of your own</span></div><div class="m"><code>in_transaction</code><span>whether a block is open</span></div><div class="m"><code>after_commit</code><span>work for once the rows are durable</span></div><div class="g">what is remembered between reads</div><div class="m"><code>uncached</code><span>a block whose reads must not come out of memory</span></div><div class="m"><code>forget_all</code><span>drop every cached row this store can see — the pool's, or its own where it has no pool</span></div><div class="g">seeing what it did</div><p class="gn">Ten kinds of span, and <code>watching(kind=…)</code> takes one of them: <code>checkout</code>, <code>connect</code>, <code>caller</code>, <code>transaction</code>, <code>statement</code>, <code>execute</code>, <code>hydrate</code>, <code>cache</code>, <code>returning</code>, <code>prepare</code>. <code>cache</code> is the odd one out: it is the read that did not happen, opened on a hit and on nothing else, so a page the cache answered is a node in the tree rather than a gap in it.</p><div class="m"><code>watching</code><span>collect what dray does</span></div><div class="m"><code>span</code><span>a name of your own in the trace</span></div><div class="g">what it is</div><div class="m"><code>conn</code><span>the connection, which is yours to use</span></div><div class="m"><code>dsql</code><span>whether this is DSQL or PostgreSQL-shaped</span></div><div class="m"><code>serves</code><span>the records this store knows</span></div></section>
+<section class="card" style="--accent:#a8620a"><h2>a collection</h2><p class="cs">What <code>store.people</code> is, and what a <code>@collection</code> class inherits.</p><div class="g">writing</div><div class="m"><code>add</code><span>write one, and whatever it has queued</span></div><div class="m"><code>add_all</code><span>write many, in transactions that fit</span></div><div class="m"><code>save</code><span>write one that exists</span></div><div class="m"><code>save_all</code><span>write many that exist</span></div><div class="m"><code>delete</code><span>remove it and everything below it</span></div><div class="g">prebuilt reads — the 90%</div><div class="m"><code>find</code><span>equality, and nothing else</span></div><div class="m"><code>find_first</code><span>the first, or None</span></div><div class="m"><code>by_id</code><span>by key, raising if it is not there</span></div><div class="m"><code>count</code><span>how many match</span></div><div class="m"><code>counts_for</code><span>how many per parent, in one statement</span></div><div class="m"><code>in_batches</code><span>walk more than you can hold</span></div><div class="g">reads you wrote — the other 10%</div><div class="m"><code>select_many</code><span>SQL you wrote, records back</span></div><div class="m"><code>select_first</code><span>SQL you wrote, one record or None</span></div><div class="m"><code>select_rows</code><span>SQL you wrote, rows back</span></div><div class="g">names for your own statements</div><p class="gn">The seven names and <code>sql_for</code> come off a record class too, through <code>dray.names_of(cls)</code> — which is the only door a <code>@child</code> declared without <code>collection=</code> has. <code>sql_for</code> is the one that answers for a field named at runtime: the column's name where the class gives it one, and the cast out of the blob where it does not.</p><div class="m"><code>table</code><span>the table name, for a statement of your own</span></div><div class="m"><code>columns</code><span>every column, for a select that must be whole</span></div><div class="m"><code>id</code><span>the key column</span></div><div class="m"><code>etag</code><span>the guard column</span></div><div class="m"><code>blob</code><span>the jsonb column</span></div><div class="m"><code>parent_type</code><span>a child's parent's table column</span></div><div class="m"><code>parent_id</code><span>a child's parent's key column</span></div><div class="m"><code>sql_for</code><span>one field of yours, as the SQL that reads it</span></div><div class="m"><code>conn</code><span>the connection, which is yours to use</span></div><div class="g">what is remembered between reads</div><p class="gn">Two things, and they are invalidated differently. A record that said <code>cached_for=</code> has its rows kept and served to <code>by_id</code> alone, filled by every read of whole records, and dropped by dray after dray&#39;s own writes — so <code>forget</code> is for the row that moved some other way. A method of yours marked <code>@cached_for(...)</code> has its answer kept under the arguments it was called with, and <b>nothing evicts that</b>: a write to any record can change what it answers and dray cannot know which. <code>forget_all</code> and <code>cache_info</code> cover both.</p><div class="m"><code>forget</code><span>drop one record, for a row that moved some other way</span></div><div class="m"><code>forget_all</code><span>drop every row cached for this collection</span></div><div class="m"><code>cache_info</code><span>hits, misses and size — None where nothing is cached</span></div></section>
+<section class="card" style="--accent:#2d6a9f"><h2>a record</h2><p class="cs">What <code>@record</code> puts on your class. A name you define yourself is left alone — dray binds the plain word only where the hierarchy has not spoken for it.</p><div class="g">lent — yours to claim, and dray's is still there under <code>_dray_</code></div><div class="m"><code>as_dict</code><span>every field, by name</span></div><div class="m"><code>children</code><span>what kinds hang off this record</span></div><div class="m"><code>delete</code><span>remove it and everything below it</span></div><div class="m"><code>parse</code><span>build from data that came from outside — strict</span></div><div class="m"><code>save</code><span>write one that exists</span></div><div class="m"><code>store</code><span>where it came from, so a rule can read across</span></div><div class="g">bound outright, under dray's own prefix</div><div class="m"><code>_dray_blob</code><span></span></div><div class="m"><code>_dray_load</code><span></span></div><div class="m"><code>_dray_validate</code><span></span></div><div class="g">dunders, lent the same way</div><div class="m"><code>__eq__</code><span></span></div><div class="m"><code>__hash__</code><span></span></div><div class="m"><code>__setattr__</code><span></span></div><div class="g">plus every field you declared, and <code>id</code> and <code>etag</code></div></section>
+<section class="card" style="--accent:#1a7f5a"><h2>a child set</h2><p class="cs">What <code>person.notes</code> is. Reads are always scoped to this parent, which is the point of reaching children through one.</p><div class="g">queued on the parent, written by its save</div><div class="m"><code>add</code><span>queue one, written by the parent's next save</span></div><div class="g">a write that happens where it is called</div><p class="gn">Neither waits for the parent's save, because a removal has no change to ride with. What they run is decided by the child class: one statement per generation where it declares no <code>@before_delete</code>, and the children read and the rule run on each where it does. <code>clear</code> is one transaction and all or nothing; <code>thin</code> is one transaction per pass and the only door here that can leave a rule run for some of a generation and never for the rest.</p><div class="m"><code>clear</code><span>empty it now — the stored rows and the queue alike</span></div><div class="m"><code>thin</code><span>one pass, one generation, up to at_a_time rows — loop it</span></div><div class="g">read, always scoped to this parent</div><div class="m"><code>by_id</code><span>by key, raising if it is not there</span></div><div class="m"><code>count</code><span>how many match</span></div><div class="m"><code>find</code><span>equality, and nothing else</span></div><div class="m"><code>find_first</code><span>the first, or None</span></div></section>
+<section class="card" style="--accent:#7d3cb5"><h2>a write</h2><p class="cs">What a <code>@before_save</code> is handed as well as the record, and what an <code>on_add</code>, an <code>on_save</code> or a <code>derived</code> handler is given.</p><div class="g">what a rule is handed</div><p class="gn">Frozen, <code>was</code> included, and one per record per save — one object for every attempt of a commit DSQL refuses. <code>record</code> is the record as it <i>will be</i>, so a rule about what the row said a moment ago reads <code>write.was.get(name, record.name)</code> — the mapping where the field moved, the record where it did not.</p><div class="m"><code>record</code><span>the record this write is about, with every assignment on it</span></div><div class="m"><code>adding</code><span>true on the write that creates it, false on a save</span></div><div class="m"><code>given</code><span>what the write was told — the store's defaults under given=</span></div><div class="m"><code>was</code><span>what it held before this write, for the fields that moved</span></div></section>
+</div>
+<div class="decs">
+<h3>Declaring it</h3>
+<div class="panel pair2">
+  <div><div class="dec"><code>@record</code><div><span class="what">a plain class becomes a record</span><code class="args">table= collection= indexes= key= etag= blob= order_by= cached_for= cache_most=</code></div></div><div class="dec"><code>@child</code><div><span class="what">a record that belongs to another</span><code class="args">of= name= table= collection= order_by= indexes= key= etag= blob= parent_type= parent_id= cached_for= cache_most=</code></div></div><div class="dec"><code>@collection</code><div><span class="what">the vocabulary a record has of its own</span><code class="args">of=</code></div></div><div class="dec"><code>field()</code><div><span class="what">what a field will take and what fills it</span><code class="args">default= default_factory= stored_in= choices= converter= validator= on_add= on_save= on_change= derived= precision= scale=</code></div></div><div class="dec"><code>index()</code><div><span class="what">what the table is indexed for</span><code class="args">*columns unique=</code></div></div></div>
+  <pre class="ex">@<b>record</b>(table="person", collection="people",
+        indexes=[<b>index</b>("status", "family_name")])
+class Person:
+    family_name: str = <b>field</b>()
+    status: str = <b>field</b>(default="enquiry", choices=STATUSES)
+    suburb: str | None = <b>field</b>(stored_in="blob")
+
+
+@<b>child</b>(of=Person, name="notes", table="note",
+       collection="notes")
+class Note:
+    body: str = <b>field</b>(default="")
+
+
+@<b>collection</b>(of=Note)
+class Notes(Collection):
+    def since(self, when): ...</pre>
+</div>
+<h3>Markers you put on a method</h3>
+<div class="panel"><div class="dec dec3"><code>@check</code><div><span class="what">a rule about the whole record, past what a field's validator can see</span></div><pre class="ex small">@check
+def volunteer_status_requires_suburb(self): ...</pre></div><div class="dec dec3"><code>@before_save</code><div><span class="what">a rule inside the write's own transaction, so it may read and write — and the only marked method handed the write as well as the record</span></div><pre class="ex small">@before_save
+def event_must_have_room(self, write): ...</pre></div><div class="dec dec3"><code>@before_delete</code><div><span class="what">a rule no removal door can avoid</span></div><pre class="ex small">@before_delete
+def record_their_departure(self): ...</pre></div><div class="dec dec3"><code>@after_commit</code><div><span class="what">work for once the rows are durable</span></div><pre class="ex small">@after_commit
+def send_goodbye_notification(self): ...</pre></div></div>
+<h3>Functions, and where each one goes</h3>
+<div class="panel"><div class="g">handed to a declaration</div><div class="dec"><code>clock</code><div><span class="what">the database&#39;s clock, for a field recording when something happened. Handed uncalled: dray runs it on the server, once per write</span><code class="args"></code></div></div><div class="dec"><code>records_change()</code><div><span class="what">queue a line about the change, in the child named</span><code class="args">into=</code></div></div><div class="dec"><code>asc()</code><div><span class="what">forwards, and where the empty ones go</span><code class="args">name nulls=</code></div></div><div class="dec"><code>desc()</code><div><span class="what">newest first, and where the empty ones go</span><code class="args">name nulls=</code></div></div><div class="dec"><code>jsonb()</code><div><span class="what">a value on its way to the <code>jsonb</code> column, or to a filter against one</span><code class="args">value</code></div></div><div class="dec"><code>as_uuid()</code><div><span class="what">a <code>UUID</code>, from one or from the string a URL hands you</span><code class="args">value</code></div></div><div class="g">called in code of your own</div><div class="dec"><code>any_of()</code><div><span class="what">equal to any of these</span><code class="args">*values</code></div></div><div class="dec"><code>none_of()</code><div><span class="what">equal to none of these, and a field holding nothing counts as one</span><code class="args">*values</code></div></div><div class="dec"><code>key_of()</code><div><span class="what">the key of a record, whatever this class calls the column</span><code class="args">record</code></div></div><div class="dec"><code>names_of()</code><div><span class="what">the names dray owns on a record class, for a statement you wrote</span><code class="args">cls</code></div></div><div class="dec"><code>describe()</code><div><span class="what">what happened, in a sentence</span><code class="args">change</code></div></div><div class="dec"><code>@replaying</code><div><span class="what">run a function of yours again when DSQL refuses what it wrote</span><code class="args">attempts=5</code></div></div><div class="dec"><code>@cached_for()</code><div><span class="what">keep what a collection method of yours answers, for this many seconds. A lifetime and nothing else — no write evicts it, because dray cannot know which answers a write changed</span><code class="args">seconds cache_most=</code></div></div><div class="dec"><code>@retrying</code><div><span class="what">dray&#39;s own, and not yours. It catches what <code>store.transaction()</code> has already turned into a <code>CommitRefused</code>, so on your function it replays nothing and looks like it works. Reachable, and outside <code>__all__</code> on purpose</span><code class="args">work</code></div></div></div>
+</div>
+</section>
+
+<section class="part" id="doors">
+<h2>Every door, and what it runs</h2>
+<p class="lead">A column is one door and reads downward as the path it takes; a
+row is one stage and reads across as which doors bother with it. Read
+<code>@check</code> across: it runs where a whole record arrives from outside
+and at every write, and nowhere else — a rule reaching across fields cannot be
+judged halfway through changing one. The three middle rows are every way a
+field can refuse a value; <code>precision=</code> is not a fourth, since no
+door judges it — a too-precise number is carried untouched and rounded by the
+column when the row lands, and only a number too large for the column is
+refused, by the database rather than by dray. And a write runs neither the
+converter nor <code>on_change</code>: it judges what is there and fills what it
+owns.</p>
+<table>
+<thead>
+<tr class="grp"><th></th>
+  <th colspan="4">in — a record arrives, or a value is changed</th>
+  <th colspan="2">out — a record is written</th>
+  <th></th></tr>
+<tr><th></th><th class="dh"><span style="color:#2d6a9f">Person(...)</span><span class="dw">your own code</span></th><th class="dh"><span style="color:#2d6a9f">Person.parse(row)</span><span class="dw">data from outside</span></th><th class="dh"><span style="color:#5b6169">a read → _dray_load</span><span class="dw">a row this table holds</span></th><th class="dh"><span style="color:#2d6a9f">record.field = value</span><span class="dw">at any time after</span></th><th class="dh"><span style="color:#a8620a">add · add_all</span><span class="dw">the first write</span></th><th class="dh"><span style="color:#a8620a">save · save_all</span><span class="dw">every write after</span></th><th class="dh"><span>in code</span></th></tr>
+</thead>
+<tbody><tr><th><span class="sn">refuse an unknown name</span><span class="sw">a name the class declares no field for</span></th><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:transparent"></span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:transparent"></span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:transparent"></span></div></td><td class="code"><pre>Person.parse({"family_name": "hemingway", "<b>give_anme</b>": "raises"})</pre></td></tr><tr><th><span class="sn">converter</span><span class="sw">turns what arrived into what the field holds</span></th><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#b8860b">◐</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#b8860b">◐</span></div></td><td class="code"><pre>family_name: str = field(<b>converter</b>=<b>str.title</b>)</pre></td></tr><tr><th><span class="sn">the declared type</span><span class="sw">what the annotation says it holds</span></th><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td class="code"><pre>joined_on: <b>date | None</b> = field()</pre></td></tr><tr><th><span class="sn">choices=</span><span class="sw">one of a list, and nothing else</span></th><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td class="code"><pre>status: str = field(<b>choices</b>=STATUSES)</pre></td></tr><tr><th><span class="sn">validator=</span><span class="sw">a function of your own, raising to refuse</span></th><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td class="code"><pre>family_name: str = field(<b>validator</b>=not_in_capitals)</pre></td></tr><tr><th><span class="sn">on_add</span><span class="sw">fills a field the first write owns</span></th><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:transparent"></span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:transparent"></span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:transparent"></span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:transparent"></span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td class="code"><pre>created_at: datetime | None = field(<b>on_add</b>=clock)</pre></td></tr><tr><th><span class="sn">on_save</span><span class="sw">fills a field every later write owns</span></th><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:transparent"></span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:transparent"></span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:transparent"></span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:transparent"></span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td class="code"><pre>updated_at: datetime | None = field(<b>on_add</b>=clock, <b>on_save</b>=clock)</pre></td></tr><tr><th><span class="sn">derived=</span><span class="sw">worked out from other fields, never assigned</span></th><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td class="code"><pre>full_name: str = field(<b>derived</b>=lambda r: f"{r.given} {r.family}")</pre></td></tr><tr><th><span class="sn">@check</span><span class="sw">a rule reaching across more than one field</span></th><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td class="code"><pre><b>@check</b>
+def volunteer_status_requires_suburb(self): ...</pre></td></tr><tr><th><span class="sn">the value is set</span><span class="sw">and marked as said, which is what a save writes</span></th><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#1a7f5a">●</span></div></td><td class="code"><pre>person.suburb <b>=</b> "Katoomba"</pre></td></tr><tr><th><span class="sn">what it was, kept</span><span class="sw">the first prior value per field, for a rule to read off the write as <code>was</code></span></th><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#b8860b">◐</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td class="code"><pre>if write.<b>was</b>.get("owner", self.owner) != write.given["whom"]: ...</pre></td></tr><tr><th><span class="sn">on_change</span><span class="sw">and only if the value actually moved</span></th><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:#dfe6ec"></span><span class="dot" style="color:#b8860b">◐</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td><div class="cell"><span class="rail" style="background:transparent"></span><span class="dot" style="color:#c8ced4">○</span></div></td><td class="code"><pre>status: str = field(<b>on_change</b>=records_change(into="logs"))</pre></td></tr></tbody>
+</table>
+<div class="key">
+  <span><b style="color:#1a7f5a">●</b> runs</span>
+  <span><b style="color:#c8ced4">○</b> deliberately skipped</span>
+  <span><b style="color:#b8860b">◐</b> partly — see the row</span>
+  <span>blank — nothing to do at this door</span>
+</div>
+</section>
+
+<section class="part" id="tx">
+<h2>Where the transaction is</h2>
+<p class="lead">The boundary nothing above draws, and the one that decides what
+a refusal takes back with it. A read opens none of its own; a write opens one
+and replays it whole when DSQL refuses the commit. Open a block yourself and
+every one of them joins it instead — which turns the replay off, and moves
+<code>@check</code> inside, so the one thing it cannot normally undo it now
+can.</p>
+<table>
+<thead><tr><th></th>
+  <th class="dh"><span>on its own</span></th>
+  <th class="dh"><span>inside a <code>store.transaction()</code> you opened</span></th>
+</tr></thead>
+<tbody><tr><th><span class="sn">a read</span><span class="sw">find · count · by_id · in_batches</span></th><td class="tx"><b>no transaction of its own</b><span>one statement, its own at the database</span></td><td class="tx"><b>joins yours</b><span>and sees what you have written in it</span></td></tr><tr><th><span class="sn">a write</span><span class="sw">add · add_all · save · save_all</span></th><td class="tx"><b>one of its own, per chunk</b><span>replayed whole if DSQL refuses the commit</span></td><td class="tx"><b>joins yours</b><span>never replayed — CommitRefused, and the work is yours to run again</span></td></tr><tr><th><span class="sn">a delete</span><span class="sw">delete · clear, and every generation under what goes</span></th><td class="tx"><b>one of its own</b><span>deepest first, so nothing is orphaned partway</span></td><td class="tx"><b>joins yours</b><span>and the 3,000-row ceiling is yours to stay under</span></td></tr><tr><th><span class="sn">thin</span><span class="sw">one generation, up to at_a_time rows</span></th><td class="tx"><b>one of its own, per pass</b><span>so the loop is several — which is the only way past a ceiling that counts a transaction</span></td><td class="tx"><b>joins yours</b><span>so the whole loop is one transaction again, which is the thing thin exists to avoid</span></td></tr><tr><th><span class="sn">@check</span><span class="sw">before any statement, and late on a child a rule queued</span></th><td class="tx"><b>outside the transaction</b><span>so anything it writes survives its own refusal — a late child's runs inside, and does not</span></td><td class="tx"><b>inside yours</b><span>so anything it writes goes back with the block</span></td></tr><tr><th><span class="sn">@before_save</span><span class="sw">before the statements</span></th><td class="tx"><b>inside, and inside the replay</b><span>run again on every attempt, which is why it may write</span></td><td class="tx"><b>inside yours</b><span>and run once, because there is no replay</span></td></tr><tr><th><span class="sn">@after_commit</span><span class="sw">when the rows are durable</span></th><td class="tx"><b>after the commit, once</b><span>outside the replay — it must not fire twice</span></td><td class="tx"><b>held until your block commits</b><span>so it means what it says</span></td></tr></tbody>
+</table>
+</section>
+
+<section class="part" id="names">
+<h2>What one assignment line does</h2>
+<p class="lead">The <code>record.field = value</code> column above is one cell
+wide and hides six different endings. Which one you get depends on nothing but
+what the name is — two are refusals that never reach a converter, and one is
+not dray's business at all.</p>
+<table><tbody><tr><th><span class="sn">the key</span></th><td class="code"><pre><b>person.id</b> = something</pre></td><td><span class="tag" style="color:#b4453a;border-color:#b4453a33">refused</span></td><td class="res"><b>AttributeError</b><span>a key cannot be changed once the record exists</span></td></tr><tr><th><span class="sn">a derived= field</span></th><td class="code"><pre><b>person.full_name</b> = something</pre></td><td><span class="tag" style="color:#b4453a;border-color:#b4453a33">refused</span></td><td class="res"><b>AttributeError</b><span>it is worked out from other fields, so there is nothing to set</span></td></tr><tr><th><span class="sn">a field you declared</span></th><td class="code"><pre><b>person.family_name</b> = something</pre></td><td><span class="tag" style="color:#1a7f5a;border-color:#1a7f5a33">managed</span></td><td class="res"><b>converter → rules → set → what it was → on_change</b><span>however it is spelled — a leading underscore does not exempt it</span></td></tr><tr><th><span class="sn">the etag</span></th><td class="code"><pre><b>person.etag</b> = something</pre></td><td><span class="tag" style="color:#1a7f5a;border-color:#1a7f5a33">managed</span></td><td class="res"><b>set, and then overwritten</b><span>no refusal, and no use either: every write mints a fresh one</span></td></tr><tr><th><span class="sn">a name you never declared,<br>starting with _</span></th><td class="code"><pre><b>person._seated</b> = True</pre></td><td><span class="tag" style="color:#7d3cb5;border-color:#7d3cb533">yours</span></td><td class="res"><b>straight to the object</b><span>no column, never written, never read back — your own transient</span></td></tr><tr><th><span class="sn">a name you never declared</span></th><td class="code"><pre><b>person.nope</b> = 1</pre></td><td><span class="tag" style="color:#b4453a;border-color:#b4453a33">refused</span></td><td class="res"><b>AttributeError</b><span>nothing is stored that was not declared</span></td></tr></tbody></table>
+<div class="ws"><div class="w"><b>the constructor judges nothing</b><p>It converts and stops, so a wrong type sits on the record and is refused at the write. That leniency is bought deliberately: a row written last year has to rebuild through the same constructor.</p></div><div class="w"><b>a loaded row is judged by nothing at all</b><p>Not even the converter — or a rule tightened since would make some of your history unreadable.</p></div><div class="w"><b><code>@check</code> waits for a whole record</b><p>A rule reaching across fields cannot be judged halfway through changing one, which is why assignment falls past it and <code>parse</code> and every write do not.</p></div><div class="w"><b>a leading underscore means nothing by itself</b><p>What matters is whether you declared it. A declared <code>_field</code> is managed like any other; an undeclared one is your own and dray never looks at it.</p></div></div>
+</section>
+
+</div>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({
+    startOnLoad: true, theme: "neutral",
+    themeVariables: { fontSize: "12.5px", fontFamily:
+      "ui-sans-serif, system-ui, -apple-system, sans-serif" },
+    flowchart: { curve: "basis", nodeSpacing: 26, rankSpacing: 40,
+                  padding: 8 }
+  });
+</script>
