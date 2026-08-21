@@ -93,17 +93,17 @@ test = [
 requires-dist = [
     { name = "aurora-dsql-python-connector", extras = ["psycopg"], marker = "extra == 'dsql'", specifier = ">=0.2.7,<0.3" },
     { name = "cachetools", specifier = ">=5.3" },
-    { name = "psycopg", specifier = ">=3.3.4" },
+    { name = "psycopg", specifier = ">=3.3.4,<4" },
     { name = "psycopg-pool", marker = "extra == 'dsql'", specifier = ">=3.3.1" },
 ]
 provides-extras = ["dsql"]
 
 [package.metadata.requires-dev]
 test = [
-    { name = "psycopg", extras = ["binary"] },
-    { name = "pytest" },
-    { name = "pytest-postgresql" },
-    { name = "pytest-xdist" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.3.4" },
+    { name = "pytest", specifier = ">=8" },
+    { name = "pytest-postgresql", specifier = ">=6" },
+    { name = "pytest-xdist", specifier = ">=3" },
 ]
 
 [[package]]

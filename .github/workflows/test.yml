@@ -65,3 +65,41 @@ jobs:
       # without it the suite cannot even be collected.
       - name: Run the suite
         run: uv run --group test --extra dsql pytest tests -q
+
+  floor:
+    runs-on: ubuntu-latest
+    name: oldest dependencies
+
+    # The floor is a claim in `pyproject.toml` that nothing else checks: if dray
+    # reaches for something that arrived later, a user pinned to the minimum
+    # gets an `AttributeError` and the metadata told them it would be fine.
+    # Oldest supported Python with it, since that is where an old dependency is
+    # most likely to disagree.
+    steps:
+      - uses: actions/checkout@v7
+
+      # The same reason as above, and the same two lines: `pytest-postgresql`
+      # wants the server binaries on PATH rather than a database to connect to.
+      - name: Put PostgreSQL's server binaries on PATH
+        run: |
+          bin=$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1)
+          if [ -z "$bin" ]; then
+            echo "No PostgreSQL server binaries on this image." >&2
+            exit 1
+          fi
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - uses: astral-sh/setup-uv@v10.0.0
+        with:
+          python-version: "3.12"
+
+      # Resolve to the end being tested, then run frozen so the suite cannot
+      # quietly re-resolve back to something comfortable.
+      - name: Resolve at the declared minimums
+        run: uv lock --resolution lowest-direct
+
+      - name: What it resolved
+        run: uv pip list
+
+      - name: Run the suite
+        run: uv run --frozen --group test --extra dsql pytest tests -q

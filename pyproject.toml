@@ -22,7 +22,11 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "psycopg>=3.3.4",
+    # Capped below 4 because a major may change what a call does, and dray
+    # should not promise a version nothing has ever run. The scheduled job
+    # installs past this cap deliberately, so the day 4.0 lands we hear it from
+    # a check rather than from somebody's traceback.
+    "psycopg>=3.3.4,<4",
     # The read cache's expiry and its size limit. Hand-rolling those is a day's
     # work and a decade of corner cases, and `functools.lru_cache` cannot do
     # either — no lifetime, and no way to drop a single key, which is the whole
@@ -61,12 +65,15 @@ Documentation = "https://github.com/draylabs/dray/blob/main/docs/manual.md"
 Source = "https://github.com/draylabs/dray"
 Issues = "https://github.com/draylabs/dray/issues"
 
+# Floors rather than bare names, so a run at `--resolution lowest-direct` asks
+# for something that exists rather than the oldest pytest on PyPI. These bound
+# the environment the suite runs in and reach no user.
 [dependency-groups]
 test = [
-    "pytest",
-    "pytest-xdist",
-    "pytest-postgresql",
-    "psycopg[binary]",
+    "pytest>=8",
+    "pytest-xdist>=3",
+    "pytest-postgresql>=6",
+    "psycopg[binary]>=3.3.4",
 ]
 
 [tool.pytest.ini_options]

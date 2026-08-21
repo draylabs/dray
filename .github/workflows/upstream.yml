@@ -1,0 +1,94 @@
+name: upstream check
+
+# What somebody else published, run against our suite. Nothing here can be
+# broken by a change in this repository, which is the whole distinction: `tests`
+# answers for a diff, and this answers for a release nobody here made.
+#
+# On a schedule rather than on a push, because the moment worth hearing about is
+# when somebody upstream releases, and that has nothing to do with when anybody
+# here is working. `workflow_dispatch` is here because a weekly cron is a poor
+# way to iterate on a workflow, and because "does the newest psycopg break us"
+# is a question worth being able to ask on the day.
+#
+# The floor end of the same question lives in `tests` instead, beside the diff
+# that could break it.
+on:
+  schedule:
+    # Monday morning in Sydney, so a break has the week to be dealt with rather
+    # than landing on a Friday night.
+    - cron: "0 22 * * 0"
+  workflow_dispatch:
+
+jobs:
+  latest:
+    runs-on: ubuntu-latest
+    name: newest allowed
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Put PostgreSQL's server binaries on PATH
+        run: |
+          bin=$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1)
+          if [ -z "$bin" ]; then
+            echo "No PostgreSQL server binaries on this image." >&2
+            exit 1
+          fi
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - uses: astral-sh/setup-uv@v10.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Resolve to the newest allowed
+        run: uv lock --upgrade
+
+      - name: What it resolved
+        run: uv pip list
+
+      - name: Run the suite
+        run: uv run --frozen --group test --extra dsql pytest tests -q
+
+  ahead:
+    runs-on: ubuntu-latest
+    name: past the cap
+
+    # `psycopg` is capped below 4 so a major cannot reach a user untested. That
+    # cap also blinds every job above it — `--upgrade` respects our own
+    # metadata, so the day 4.0 ships they carry on resolving 3.x and stay green
+    # through the whole of its existence.
+    #
+    # So this one asks for psycopg directly, which ignores the cap, and runs the
+    # suite against whatever the newest release actually is. Green means the cap
+    # is now the only thing in the way and lifting it is a decision rather than a
+    # gamble. Red is the answer to "not yet", arriving as a check rather than as
+    # somebody's traceback.
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Put PostgreSQL's server binaries on PATH
+        run: |
+          bin=$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1)
+          if [ -z "$bin" ]; then
+            echo "No PostgreSQL server binaries on this image." >&2
+            exit 1
+          fi
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - uses: astral-sh/setup-uv@v10.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Build the environment the ordinary way
+        run: uv sync --group test --extra dsql
+
+      # Directly rather than through the project, which is what steps over the
+      # cap. `--no-sync` on the run below, or uv puts the capped version back.
+      - name: Install psycopg past the cap
+        run: uv pip install --upgrade psycopg
+
+      - name: What it resolved
+        run: uv pip list
+
+      - name: Run the suite
+        run: uv run --no-sync --group test --extra dsql pytest tests -q
