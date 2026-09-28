@@ -84,8 +84,11 @@ jobs:
 
       # Directly rather than through the project, which is what steps over the
       # cap. `--no-sync` on the run below, or uv puts the capped version back.
+      # With the `binary` extra, because the compiled half is a separate package
+      # that has to move in step: bare `psycopg` upgrades only the Python half,
+      # and a newer one calling into an older binary fails on every connection.
       - name: Install psycopg past the cap
-        run: uv pip install --upgrade psycopg
+        run: uv pip install --upgrade 'psycopg[binary]'
 
       - name: What it resolved
         run: uv pip list
