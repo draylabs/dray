@@ -2978,9 +2978,39 @@ site has no information a wait can be chosen from.
 
 It catches both of the ways a refusal reaches you. `CommitRefused` is the commit
 of a block your function opened; `ConcurrencyExhausted` is an ordinary save
-inside it that dray had already replayed five times on its own account, which
+inside it that dray had already replayed to five attempts on its own account, which
 under real contention on one row happens often enough to be worth catching. The
 attempts you set are the depth dray's own five deliberately do not have.
+
+**A change to the schema refuses commits as well**, and it is a different
+refusal with a different cause. A cluster holds one schema for everything in
+it, and a session whose view of that has gone stale has its next writing commit
+refused — `schema has been updated by another transaction (OC001)`, where two
+writers on one row are `OC000`. It does not have to be your table. An index
+built on a table your code never touches refuses the next commit of every
+session that writes, once for each change, and a read is never refused at all.
+
+Which makes a migration a burst of them. Thirty statements run back to back
+against a cluster took under three seconds, and four writers saving throughout
+were refused often enough for an ordinary save to lose five attempts in a row —
+on rows nobody else was writing.
+
+So dray counts the two apart. A refusal over the schema does not spend one of
+a save's five attempts, because it says nothing about contention and the five
+were chosen for contention. It has an allowance of its own, twenty attempts,
+which is the length of a migration rather than of a crowd — and no wait
+between them, since there is no crowd to let thin. Under eleven schema changes
+a second, replaying at once landed sooner than waiting did.
+
+`@replaying` does the same for a block your function opened. When either
+allowance runs out the `ConcurrencyExhausted` says which it was, and a save
+that has run out over the schema is not run again by a `@replaying` around it:
+twenty attempts have been made, and the answer is that a migration is still
+running.
+
+A block with no `@replaying` on it gets `CommitRefused` from a schema change
+exactly as it does from another writer — the block is yours to run again either
+way — and the message says which of the two refused it.
 
 **It cannot be a `with` block**, which is the shape everybody reaches for.
 `with store.replaying(3):` will not exist, because Python will not do it: a
@@ -3406,7 +3436,8 @@ refuses, and this is registered outside the part that is replayed, exactly as an
 `on_add` or an `on_save` is filled outside it. That is the opposite of where a
 `@before_delete` sits, and deliberately: that one is work a rollback destroyed
 and has to redo, and this one is the announcement of a write that is already
-durable. A job enqueued from inside the replay goes out five times for one save.
+durable. A job enqueued from inside the replay goes out once for every attempt
+the save took.
 
 **Two saves are two runs.** It is about the write rather than about the record,
 and two writes happened — including two saves of the same record inside one
@@ -4157,7 +4188,7 @@ reason.
 | `DuplicateRecord` | a unique constraint refused an insert — `columns` and `constraint` say which |
 | `CommitRefused` | DSQL refused the commit of a block you opened, and dray does not replay those |
 | `AfterCommitFailed` | the rows committed and an `after_commit` handler then raised |
-| `ConcurrencyExhausted` | DSQL refused the same write five times running, or a `@replaying` function as many times as it was given |
+| `ConcurrencyExhausted` | DSQL refused the same write five times running over its rows or twenty over the schema, or a `@replaying` function as many times as it was given or twenty over the schema |
 | `ConnectionLost` | the connection was closed underneath the store — see *Connections* |
 
 Everything else is the database's, and arrives as `psycopg` raised it: a check
@@ -4236,6 +4267,12 @@ wait is well under the total, and 750 ms on top of five round trips is the
 worst dray's own replay can add to anything, whether it ends up landing or
 raising.
 
+A schema change underneath it adds round trips to that and no waiting. Those
+replays are counted on their own and made at once, up to twenty attempts, so
+a save that meets a migration is longer by the round trips it took to land —
+and a `ConcurrencyExhausted` over the schema arrives after twenty of them,
+rather than after any fixed time.
+
 `@replaying` waits the same way and on top of that, which is what makes the
 count you give it a number to choose against a timeout somebody is waiting on.
 Its waits climb no higher than 400 ms however many attempts you ask for, so
@@ -4266,6 +4303,12 @@ loses a commit — and it is a JVM tool. `yoyo-migrations` is the same idea in
 Python. Or neither: applying files in order and recording what ran is a page of
 your own code, and the `if not exists` above is the property that makes it
 enough.
+
+Whatever runs them, each statement refuses the next commit of every session
+that is writing at the time, on any table — *Running it again* above has the
+measurements. dray replays its own writes through that. A block you opened is
+yours to run again, so the code a migration runs beside is the code that most
+needs `@replaying` on it.
 
 Data is the part to think about rather than schema. A backfill past 3,000 rows
 is not one statement on DSQL and no runner makes it one, so anything large is a

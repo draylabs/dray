@@ -371,7 +371,18 @@ def test_a_schema_that_will_not_settle_is_reported_rather_than_hidden(
     def always_refuses(self, statement):
         raise psycopg.errors.SerializationFailure("(OC001)")
 
-    monkeypatch.setattr(Store, "_ddl", retrying(always_refuses))
+    asked = []
 
-    with pytest.raises(ConcurrencyExhausted):
+    def counted(self, statement):
+        asked.append(statement)
+        return always_refuses(self, statement)
+
+    monkeypatch.setattr(Store, "_ddl", retrying(counted))
+
+    with pytest.raises(ConcurrencyExhausted, match="changes to the schema"):
         store.create(Runner)
+
+    # The allowance a schema conflict gets on any write, and no wait in it.
+    from dray.store import SCHEMA_ATTEMPTS
+
+    assert len(asked) == SCHEMA_ATTEMPTS

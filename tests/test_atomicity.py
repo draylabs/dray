@@ -27,7 +27,7 @@ from dray import (
     record,
     replaying,
 )
-from dray.store import ATTEMPTS, ConcurrencyExhausted, retrying
+from dray.store import ATTEMPTS, SCHEMA_ATTEMPTS, ConcurrencyExhausted, retrying
 
 
 @record(table="probe", collection="probes")
@@ -693,6 +693,214 @@ def refusing(times, monkeypatch):
     monkeypatch.setattr(
         Collection, "_commit_batch", retrying(refusing_at_first)
     )
+
+
+OVER_ROWS = "change conflicts with another transaction (OC000)"
+OVER_THE_SCHEMA = "schema has been updated by another transaction (OC001)"
+
+
+def refusing_as(messages, monkeypatch):
+    """`refusing`, saying which kind of no each one is. DSQL sends one
+    SQLSTATE for both and tells them apart in the message, so the message is
+    what is faked. The waits are recorded rather than slept through, and what
+    comes back is the attempts made and then the waits taken.
+    """
+    from dray.collection import Collection
+
+    real = Collection._commit_batch
+    coming = iter(messages)
+    asked, waited = Asked(), []
+    asked.waited = waited
+
+    def refusing_at_first(self, *args, **kwargs):
+        asked.append(self.store._attempt)
+        message = next(coming, None)
+        if message is not None:
+            raise psycopg.errors.SerializationFailure(message)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        Collection, "_commit_batch", retrying(refusing_at_first)
+    )
+    monkeypatch.setattr("dray.store.waiting", waited.append)
+    return asked
+
+
+class Asked(list):
+    """The attempts `refusing_as` saw, with the waits between them beside it."""
+
+    waited: list
+
+
+def test_a_schema_change_does_not_spend_a_saves_attempts(probes, monkeypatch):
+    """A cluster refuses the next writing commit of every session once for
+    each schema change anywhere in it, so a migration of a dozen statements is
+    a dozen refusals in a row for a save on a row nobody else is writing. The
+    five attempts were chosen against contention and that is not it. Nor is
+    there anything to wait for: the refusal is over once it has been given."""
+    asked = refusing_as([OVER_THE_SCHEMA] * 12, monkeypatch)
+
+    probes.probes.add(Probe(name="rode it out"))
+
+    assert len(asked) == 13
+    assert asked.waited == []
+    assert [probe.name for probe in probes.probes.find()] == ["rode it out"]
+
+
+def test_the_two_kinds_of_refusal_are_counted_apart(probes, monkeypatch):
+    """Four over rows is one short of giving up, and stays one short however
+    many schema changes land in between — and the other way about. Each count
+    is a bound on its own thing."""
+    mixed = [OVER_ROWS, OVER_THE_SCHEMA] * (ATTEMPTS - 1) + [OVER_THE_SCHEMA] * 6
+    asked = refusing_as(mixed, monkeypatch)
+
+    probes.probes.add(Probe(name="landed"))
+
+    # The attempt a watcher is shown counts every one of them, and the waits
+    # are the four a save takes over rows and none for the schema.
+    assert asked == list(range(1, len(mixed) + 2))
+    assert asked.waited == [0, 1, 2, 3]
+
+
+def test_a_fifth_refusal_over_rows_ends_it_whatever_came_between(
+    probes, monkeypatch
+):
+    """The schema refusals in between neither spend the five nor give any of
+    them back."""
+    mixed = [OVER_ROWS, OVER_THE_SCHEMA] * (ATTEMPTS - 1) + [OVER_ROWS]
+    asked = refusing_as(mixed, monkeypatch)
+
+    with pytest.raises(ConcurrencyExhausted, match=f"conflicted {ATTEMPTS} times"):
+        probes.probes.add(Probe(name="never"))
+
+    assert len(asked) == len(mixed)
+
+
+def test_a_schema_that_never_settles_still_ends(probes, monkeypatch):
+    """An allowance and not a pardon. A schema changing for as long as anybody
+    cares to wait is a fault somebody has to hear about, and the name says
+    which of the two ran out — the message a save gets from contention would
+    send its reader looking for a writer who is not there."""
+    asked = refusing_as([OVER_THE_SCHEMA] * 99, monkeypatch)
+
+    with pytest.raises(ConcurrencyExhausted, match="changes to the schema"):
+        probes.probes.add(Probe(name="never"))
+
+    assert len(asked) == SCHEMA_ATTEMPTS
+    assert probes.probes.count() == 0
+
+
+def test_contention_still_gives_up_at_five(probes, monkeypatch):
+    """What a refusal with no code in it is taken for, which is every refusal
+    local PostgreSQL could send. Four waits between five attempts, each
+    doubling the ceiling of the one before."""
+    asked = refusing_as(["could not serialize"] * 99, monkeypatch)
+
+    with pytest.raises(ConcurrencyExhausted, match=f"conflicted {ATTEMPTS} times"):
+        probes.probes.add(Probe(name="never"))
+
+    assert len(asked) == ATTEMPTS
+    assert asked.waited == [0, 1, 2, 3]
+
+
+def test_a_refused_block_says_which_kind_refused_it(probes, monkeypatch):
+    """`because something else wrote the same rows first` is untrue of a block
+    refused by an index built on another table, and it is the sentence that
+    decides where somebody goes looking."""
+    for message, said in (
+        (OVER_THE_SCHEMA, "the schema was changed while it was open"),
+        (OVER_ROWS, "something else wrote the same rows first"),
+    ):
+        refusing_as([message], monkeypatch)
+        with pytest.raises(CommitRefused, match=said):
+            with probes.transaction():
+                probes.probes.add(Probe(name="in a block"))
+
+
+def test_replaying_rides_out_a_migration_on_its_own_allowance(
+    probes, monkeypatch
+):
+    """`@replaying(2)` is two attempts against contention. A block refused
+    eight times by schema changes has met none, so it is run again eight times
+    and lands — and one refusal over rows after that still leaves one of the
+    two the caller asked for."""
+    runs = []
+    refusing_as([OVER_THE_SCHEMA] * 8 + [OVER_ROWS], monkeypatch)
+
+    @replaying(2)
+    def rename(store, name):
+        runs.append(name)
+        with store.transaction():
+            store.probes.add(Probe(name=name))
+
+    rename(probes, "settled")
+
+    assert len(runs) == 10
+    assert [probe.name for probe in probes.probes.find()] == ["settled"]
+
+
+def test_replaying_under_a_schema_that_never_settles_still_ends(
+    probes, monkeypatch
+):
+    """And keeps the last refusal as its cause, as it does over rows."""
+    runs = []
+    refusing_as([OVER_THE_SCHEMA] * 99, monkeypatch)
+
+    @replaying
+    def rename(store, name):
+        runs.append(name)
+        with store.transaction():
+            store.probes.add(Probe(name=name))
+
+    with pytest.raises(ConcurrencyExhausted, match="rename was refused 20") as ended:
+        rename(probes, "never")
+
+    assert len(runs) == SCHEMA_ATTEMPTS
+    assert isinstance(ended.value.__cause__, CommitRefused)
+
+
+def test_a_save_out_of_schema_attempts_is_not_run_again_by_replaying(
+    probes, monkeypatch
+):
+    """An ordinary save inside the function has had twenty attempts by the
+    time it raises. Counted as contention, `@replaying(20)` would give it
+    twenty more twenty times over and then say the function conflicted — four
+    hundred attempts, reported as a thing that never happened."""
+    runs = []
+    asked = refusing_as([OVER_THE_SCHEMA] * 999, monkeypatch)
+
+    @replaying(20)
+    def rename(store, name):
+        runs.append(name)
+        store.probes.add(Probe(name=name))
+
+    with pytest.raises(ConcurrencyExhausted, match="changes to the schema"):
+        rename(probes, "never")
+
+    assert len(runs) == 1
+    assert len(asked) == SCHEMA_ATTEMPTS
+
+
+def test_a_schema_refusal_inside_somebody_elses_block_is_theirs(
+    probes, monkeypatch
+):
+    """`@replaying` runs nothing again while a block is open around it, and
+    that holds whichever kind of refusal it was. The outer transaction is
+    aborted either way, so a second run would send statements to nothing."""
+    runs = []
+    refusing_as([OVER_THE_SCHEMA], monkeypatch)
+
+    @replaying
+    def rename(store, name):
+        runs.append(name)
+        with store.transaction():
+            store.probes.add(Probe(name=name))
+
+    with pytest.raises(CommitRefused):
+        with probes.transaction():
+            rename(probes, "inner")
+
+    assert len(runs) == 1
 
 
 def test_a_refused_block_runs_the_callers_function_again(probes, monkeypatch):

@@ -66,6 +66,20 @@ def _connector() -> Any:
 # most 750 ms waiting.
 ATTEMPTS = 5
 BACKOFF = 0.05
+# How many attempts a write gets at a schema that keeps moving, counted apart
+# from the five above. A cluster refuses the next writing commit of every
+# session once for each schema change anywhere in it, so a migration is a run
+# of refusals that has nothing to do with how contended a row is — thirty
+# statements back to back cost one save seven in a row. Twenty is that with
+# room, and still a number: a schema that never stops changing is a fault
+# somebody has to hear about.
+#
+# With no wait between them, which is the other way this differs. A wait is
+# for a crowd to thin, and there is no crowd: the refusal is over once it has
+# been given, and the session that got it has the new schema. Measured under a
+# steady eleven changes a second, replaying at once landed sooner than any
+# wait did and took no more attempts than the doubling one.
+SCHEMA_ATTEMPTS = 20
 # The longest any one of those waits gets. dray's own five reach it on the last
 # of them and never exceed it, so this changes nothing about a save — it is
 # there for `@replaying`, where the count is the caller's and twenty attempts of
@@ -208,6 +222,26 @@ def _clash(cls: type, record: Any, error: Any) -> "DuplicateRecord":
 
 class ConcurrencyExhausted(DrayError, RuntimeError):
     """Replayed until the attempts ran out and still conflicted."""
+
+
+def schema_moved(refusal: BaseException) -> bool:
+    """
+    Whether a refused commit was refused over the schema rather than over rows.
+
+    DSQL answers both with one SQLSTATE and tells them apart in the message:
+    `change conflicts with another transaction (OC000)` is another writer, and
+    `schema has been updated by another transaction (OC001)` is a schema change
+    somewhere in the cluster. The code in brackets is what AWS document as the
+    way to tell, so that is what is read, and a message with neither is taken
+    for the first, which is all local PostgreSQL ever sends.
+
+    Read off the message's own line where the driver has one. `str` of a
+    server error is that line and then its detail and context, and a code is
+    only a code where DSQL put it.
+    """
+    diag = getattr(refusal, "diag", None)
+    said = getattr(diag, "message_primary", None) or str(refusal)
+    return "OC001" in said
 
 
 class CommitRefused(DrayError, RuntimeError):
@@ -354,6 +388,10 @@ def retrying(work: Callable) -> Callable:
     doubling wait and stopped running out of them altogether. What it costs is
     wall clock: five attempts is at most three quarters of a second of waiting,
     and that is dray's whole contribution to a timeout somebody is choosing.
+
+    A refusal over the schema is counted apart and replayed without a wait —
+    `SCHEMA_ATTEMPTS` above has both reasons — so it adds round trips to that
+    and no waiting.
     """
 
     @functools.wraps(work)
@@ -367,29 +405,53 @@ def retrying(work: Callable) -> Callable:
         # transaction does not inherit somebody else's second attempt.
         store = getattr(args[0], "store", args[0]) if args else None
         counting = isinstance(store, Store)
+        # Two counts, because there are two things a refusal can be about and
+        # only one of them is contention. A schema change refuses whoever
+        # commits next and is over as soon as it has, so it is replayed on its
+        # own allowance and leaves the five for the writers they were chosen
+        # against.
+        spent = moved = 0
         try:
-            for turn in range(ATTEMPTS):
+            while True:
                 if counting:
-                    store._attempt = turn + 1
+                    store._attempt = spent + moved + 1
                 try:
                     return work(*args, **kwargs)
-                except psycopg.errors.SerializationFailure:
+                except psycopg.errors.SerializationFailure as refused:
                     # Raw, so the block that owns the commit can name it.
                     # Turning it into `ConcurrencyExhausted` here would say five
                     # attempts were made where none were.
                     if enlisted(args[0]):
                         raise
-                    if turn == ATTEMPTS - 1:
+                    if schema_moved(refused):
+                        moved += 1
+                        if moved == SCHEMA_ATTEMPTS:
+                            raise _schema_exhausted(work, moved) from None
+                        continue
+                    spent += 1
+                    if spent == ATTEMPTS:
                         raise ConcurrencyExhausted(
                             f"{work.__name__} conflicted {ATTEMPTS} times"
                         ) from None
-                    waiting(turn)
-            return None
+                    waiting(spent - 1)
         finally:
             if counting:
                 store._attempt = 1
 
     return attempt
+
+
+def _schema_exhausted(work: Callable, times: int) -> ConcurrencyExhausted:
+    """What a write ends in when the schema would not hold still for it.
+
+    Marked, so that a `@replaying` further out can tell it from contention and
+    leave it alone: every attempt it could add has been made."""
+    gone = ConcurrencyExhausted(
+        f"{work.__name__} was refused {times} times by changes to the "
+        "schema, which is a migration still running or one that never stops"
+    )
+    gone._schema = True
+    return gone
 
 
 def replaying(attempts: Any = ATTEMPTS) -> Callable:
@@ -412,6 +474,12 @@ def replaying(attempts: Any = ATTEMPTS) -> Callable:
     manager may swallow what its body raised and has no way to run that body
     again.
 
+    A block refused because the schema changed is run again without spending
+    one of those attempts, and without waiting. That refusal is about a
+    migration somewhere in the cluster and not about contention, so it has an
+    allowance of its own, twenty attempts. A save inside the function that has
+    used up its own twenty is not run again at all.
+
     A count and nothing else, dray's own five by default: `@replaying(20)` for
     a job nobody is waiting on, where the wait costs nothing and giving up
     costs a run. When they run out, what comes out is `ConcurrencyExhausted`
@@ -421,8 +489,8 @@ def replaying(attempts: Any = ATTEMPTS) -> Callable:
 
     Both of the ways a refusal reaches you count as one: `CommitRefused` from
     the commit of a block your function opened, and `ConcurrencyExhausted` from
-    an ordinary save inside it that dray had already replayed five times on its
-    own account. The attempts you set are the depth those five do not have.
+    an ordinary save inside it that dray had already replayed to five attempts
+    on its own account. The attempts you set are the depth those five do not have.
 
     **What it wraps has to be safe to run twice.** Everything the function does
     is inside it, nothing is queued on a record before it, and no side effect
@@ -462,7 +530,11 @@ def _replays(work: Callable, attempts: int) -> Callable:
 
     @functools.wraps(work)
     def again(*args: Any, **kwargs: Any) -> Any:
-        for turn in range(attempts):
+        # Counted apart, as `retrying` counts them and for its reason: the
+        # attempts a caller chose are a depth against contention, and a block
+        # refused because an index was built somewhere has met none.
+        spent = moved = 0
+        while True:
             try:
                 return work(*args, **kwargs)
             # Both, because both mean the same thing to whoever wrote the
@@ -478,7 +550,19 @@ def _replays(work: Callable, attempts: int) -> Callable:
                 # to inspect, and the refusal knows regardless.
                 if getattr(refused, "_enlisted", False):
                     raise
-                if turn == attempts - 1:
+                if getattr(refused, "_schema", False):
+                    # A save inside the function that has had its own twenty
+                    # already. Running the function again would give it twenty
+                    # more for each attempt the caller asked for, and end by
+                    # reporting contention that never happened.
+                    if isinstance(refused, ConcurrencyExhausted):
+                        raise
+                    moved += 1
+                    if moved == SCHEMA_ATTEMPTS:
+                        raise _schema_exhausted(work, moved) from refused
+                    continue
+                spent += 1
+                if spent == attempts:
                     # Kept as the cause, where `retrying` drops it: every
                     # refusal here was swallowed by a replay the caller asked
                     # for, so without this the last one is the only evidence
@@ -486,8 +570,7 @@ def _replays(work: Callable, attempts: int) -> Callable:
                     raise ConcurrencyExhausted(
                         f"{work.__name__} conflicted {attempts} times"
                     ) from refused
-                waiting(turn)
-        return None
+                waiting(spent - 1)
 
     return again
 
@@ -1056,13 +1139,22 @@ class Store:
             # caller to run the work again. That would write it twice.
             if self._committed:
                 raise
+            moved = schema_moved(refused)
             telling = CommitRefused(
                 "DSQL refused the commit of a transaction you opened, because "
-                "something else wrote the same rows first. dray did not replay "
+                + (
+                    "the schema was changed while it was open — on any table "
+                    "in the cluster, not necessarily one of yours. "
+                    if moved
+                    else "something else wrote the same rows first. "
+                )
+                + "dray did not replay "
                 "it: the block is yours and only you know what is safe to run "
                 "twice. Read the records again and run the work from the top, "
                 "which is what `@dray.replaying` on that function does for you."
             )
+            # Which of the two it was, for `@replaying` to count apart.
+            telling._schema = moved
             # Whether there is still a block open around the one that was
             # refused. `_transacting` has already given its depth back by now,
             # so what is left is somebody else's. `@replaying` reads it and
@@ -1609,10 +1701,9 @@ class Store:
 
         DSQL refuses a commit whose schema moved underneath it — `OC001`, a
         schema conflict, arriving as an ordinary serialization failure — and two
-        deployments coming up at once do exactly that to each other. It is the
-        same transient as a write conflict and wants the same answer, and this
-        was the one write path with no replay on it: a second instance calling
-        `create` at the same moment as the first failed outright.
+        deployments coming up at once do exactly that to each other. It is as
+        transient as a write conflict and gets the replay a schema conflict
+        gets anywhere: up to twenty attempts, with no wait between them.
 
         Per statement rather than around the loop, so a conflict on the fourth
         does not redo the first three. Safe to replay for the reason every

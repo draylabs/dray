@@ -53,6 +53,7 @@ from dray import (
 )
 from dray.collection import MAX_ROWS, jsonb
 from dray.model import MAX_PRECISION, UNINDEXABLE
+from dray.store import SCHEMA_ATTEMPTS, schema_moved
 
 CHECKS: list[tuple[str, Callable]] = []
 RUN = uuid.uuid4().hex[:8]
@@ -171,6 +172,9 @@ def _occ(pool: Pool, table: str) -> str:
                 with b.transaction():
                     b.conn.execute(f"update {table} set n = n + 100 where id = 1")
         except CommitRefused as refused:
+            # Another check's schema change, which says nothing here.
+            if over_the_schema(refused):
+                raise
             underneath = refused.__cause__
             if not isinstance(underneath, psycopg.errors.SerializationFailure):
                 raise AssertionError(
@@ -243,7 +247,10 @@ def _for_update_reaches(pool: Pool, table: str) -> str:
                     b.conn.execute(
                         f"update {table} set on_call = false where id = %s", (two,)
                     )
-        except CommitRefused:
+        except CommitRefused as refused:
+            # Another check's schema change, which says nothing here.
+            if over_the_schema(refused):
+                raise
             left = a.conn.execute(
                 f"select count(*) from {table} where team = %s and on_call = true",
                 (team,),
@@ -641,7 +648,11 @@ def _read_inside_the_block(pool: Pool, table: str) -> str:
                                 theirs = collection.by_id(hot.id)
                             theirs.n += 1
                             theirs.save()
-                    except CommitRefused:
+                    except CommitRefused as told:
+                        # Another check's schema change, which is not the
+                        # contention being measured.
+                        if over_the_schema(told):
+                            raise
                         refused += 1
                     widths.append(time.perf_counter() - started)
             return refused, sorted(widths)[len(widths) // 2] * 1000
@@ -2070,7 +2081,12 @@ def _write_skew(pool: Pool, table: str) -> str:
                 for conn in (a.conn, b.conn):
                     conn.execute("commit")
                 return False
-            except psycopg.errors.SerializationFailure:
+            except psycopg.errors.SerializationFailure as refused:
+                # Another check's schema change refuses a commit too, and says
+                # nothing about these two. Up it goes, for the run to start
+                # over, rather than being counted as the skew refused.
+                if schema_moved(refused):
+                    raise
                 return True
             finally:
                 for conn in (a.conn, b.conn):
@@ -2146,25 +2162,75 @@ def _shared_store(pool: Pool, table: str) -> str:
 #
 
 
+def over_the_schema(error: BaseException | None) -> bool:
+    """Whether a check failed because the schema moved under it, anywhere in
+    the chain of what it raised."""
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if getattr(error, "_schema", False) or (
+            isinstance(error, psycopg.errors.SerializationFailure)
+            and schema_moved(error)
+        ):
+            return True
+        error = error.__cause__ or error.__context__
+    return False
+
+
 def run(name: str, fn: Callable, pool: Pool) -> tuple[str, bool, str, float]:
+    """
+    One check, run again where what stopped it was another check's schema.
+
+    Every check here makes its own table while the others are making theirs,
+    and a cluster refuses a writing commit once for each schema change anywhere
+    in it. dray replays its own writes through that; a check that opens a
+    transaction to watch what the cluster does with it is exactly the code
+    that is not replayed, and has to be. On a table of its own each time, so a
+    second run starts from nothing.
+    """
     table = f"dray_{RUN}_{name.replace('-', '_')}"
     started = time.monotonic()
-    try:
-        note = fn(pool, table) or "ok"
-        return name, True, note, time.monotonic() - started
-    except Exception:
-        lines = traceback.format_exc().strip().splitlines()
-        return name, False, lines[-1], time.monotonic() - started
+    for turn in range(SCHEMA_ATTEMPTS):
+        try:
+            note = fn(pool, table if not turn else f"{table}_{turn}") or "ok"
+            return name, True, note, time.monotonic() - started
+        except Exception as error:
+            if over_the_schema(error) and turn < SCHEMA_ATTEMPTS - 1:
+                continue
+            lines = traceback.format_exc().strip().splitlines()
+            return name, False, lines[-1], time.monotonic() - started
+    raise AssertionError("unreachable")
 
 
-def sweep(pool: Pool, names: list[str]) -> None:
+def sweep(pool: Pool) -> None:
+    """
+    Drop every table this run made, and say so about any it could not.
+
+    By the run's prefix rather than by the names of the checks, since a check
+    is free to make more than the one table it is handed. And more than once:
+    a drop is a schema change like any other, so it conflicts with another
+    drop, and it is refused outright while an index it would take with it is
+    still being built — both of which pass, given a moment.
+    """
     with pool.store() as store:
-        for name in names:
-            table = f"dray_{RUN}_{name.replace('-', '_')}"
-            try:
-                store.conn.execute(f"drop table if exists {table}")
-            except Exception as error:  # best effort; the failure is reported
-                print(f"  could not drop {table}: {error}")
+        tables = [
+            row[0]
+            for row in store.conn.execute(
+                "select table_name from information_schema.tables"
+                " where table_schema = current_schema() and table_name like %s",
+                [f"dray\\_{RUN}\\_%"],
+            ).fetchall()
+        ]
+        for table in tables:
+            for attempt in range(10):
+                try:
+                    store.conn.execute(f"drop table if exists {table}")
+                    break
+                except psycopg.Error as error:
+                    if attempt == 9:
+                        print(f"  could not drop {table}: {error}")
+                        break
+                    time.sleep(0.5 * (attempt + 1))
 
 
 def main() -> int:
@@ -2198,7 +2264,7 @@ def main() -> int:
             )
     finally:
         if not args.keep:
-            sweep(pool, [n for n, _ in chosen])
+            sweep(pool)
         pool.close()
 
     failed = 0
