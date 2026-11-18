@@ -14,7 +14,14 @@ from decimal import Decimal
 from uuid import UUID
 from typing import Any
 
-from dray.model import Index, Sql, _nulls, base_type, indexed_text
+from dray.model import (
+    Index,
+    Sql,
+    _nulls,
+    base_type,
+    indexed_text,
+    referenced,
+)
 from dray.store import cursor
 
 # What a `numeric` column is when the field says nothing: DSQL's own default,
@@ -234,9 +241,62 @@ def _index_name(cls: type, declared: Index) -> str:
     return f"{_shortened(named, NAME_LIMIT - 7)}_{mark}"
 
 
-def create_table(cls: type) -> str:
+def _reference_name(cls: type, name: str) -> str:
+    """What dray calls the key a `references=` field declares: the table, the
+    field, and `_fk`, cut so that the last of those survives. `drift` looks
+    for it by this name and a violation is traced back by it."""
+    return f"{_shortened(f'{cls.__dray_table__}_{name}', NAME_LIMIT - 3)}_fk"
+
+
+def _reference(cls: type, name: str) -> str:
+    """The constraint itself, as a `create table` or an `alter table` holds it.
+
+    With nothing said about what a delete of the other record does, which
+    leaves the database's own answer: it is refused. Clearing the field or
+    taking the row as well would be the database writing rows dray did not —
+    past the etag, the read cache and every hook."""
+    target = referenced(cls, name)
+    return (
+        f"constraint {_reference_name(cls, name)} foreign key ({name})"
+        f" references {target.__dray_table__} ({target.__dray_key__})"
+    )
+
+
+def references(cls: type, *, asynchronous: bool = True) -> list[str]:
+    """
+    The statements that give a table already there the keys its class
+    declares, two for each.
+
+        schema.references(Event)
+
+    The first adds the key `not valid`, which holds every write from then on
+    to it and looks at no row already in the table — the only form DSQL takes
+    on a table that exists. The second checks the rows that were there, as a
+    background job on a cluster, and fails on the first one naming a record
+    that has gone. So what points at nobody has to be put right before it
+    will pass.
+
+    `asynchronous=False` writes the second the way PostgreSQL takes it.
+    """
+    table = cls.__dray_table__
+    validate = "alter table async" if asynchronous else "alter table"
+    made = []
+    for name in cls.__dray_references__:
+        made.append(f"alter table {table} add {_reference(cls, name)} not valid")
+        made.append(
+            f"{validate} {table} validate constraint {_reference_name(cls, name)}"
+        )
+    return made
+
+
+def create_table(cls: type, *, without: Any = ()) -> str:
     """
     The `create table` for a record.
+
+    A field declared `references=` is a key here, to a table that has to
+    exist when this runs. `without` names fields whose keys to leave out, for
+    two records that name each other: make one without, make the other, and
+    add what was left out with `references`.
 
     `if not exists` because DSQL cannot put DDL and DML in one transaction, so
     the statement and the row recording that it ran cannot commit together —
@@ -263,6 +323,15 @@ def create_table(cls: type) -> str:
         f" unique ({', '.join(declared.columns)})"
         for declared in cls.__dray_indexes__
         if _is_constraint(cls, declared)
+    ]
+    # A key to another record, which that record's table has to be there for.
+    # `without` is the ones to leave out, for two tables that name each other:
+    # neither can go first carrying its key, so one is made bare and given it
+    # afterwards.
+    constraints += [
+        f"    {_reference(cls, name)}"
+        for name in cls.__dray_references__
+        if name not in without
     ]
     key = cls.__dray_key__
     lines = [
@@ -382,7 +451,9 @@ def create_indexes(cls: type, *, asynchronous: bool = True) -> list[str]:
     return [statement for _, statement in _index_statements(cls, asynchronous)]
 
 
-def statements(cls: type, *, asynchronous: bool = True) -> list[str]:
+def statements(
+    cls: type, *, asynchronous: bool = True, without: Any = ()
+) -> list[str]:
     """Everything a record's table needs, one statement per entry.
 
     One per entry because DSQL takes a single DDL statement per transaction, so
@@ -401,7 +472,7 @@ def statements(cls: type, *, asynchronous: bool = True) -> list[str]:
     constraint can carry neither: it is among the statements after, and on a
     cluster it enforces once its build has finished."""
     return [
-        create_table(cls),
+        create_table(cls, without=without),
         *(
             statement
             for constraint, statement in _index_statements(cls, asynchronous)
@@ -590,7 +661,41 @@ def drift(conn: Any, cls: type) -> list[str]:
         statement.split(" if not exists ")[1].split(" on ")[0]
         for statement in create_indexes(cls)
     }
-    return missing + [
-        f"{table} has no index {name!r}, which the class asks for"
-        for name in sorted(wanted - built)
-    ]
+    keyed = _keys(conn, table)
+    keys = {_reference_name(cls, name) for name in cls.__dray_references__}
+    return (
+        missing
+        + [
+            f"{table} has no index {name!r}, which the class asks for"
+            for name in sorted(wanted - built)
+        ]
+        + [
+            f"{table} has no key {name!r}, which the class asks for"
+            for name in sorted(keys - set(keyed))
+        ]
+        # Added and never checked against the rows that were there, which is
+        # the first of `references`' two statements run without the second.
+        # Every write since is held to it and the rows before it may not be.
+        + [
+            f"{table} has the key {name!r} and has not checked the rows that "
+            "were already there against it"
+            for name in sorted(keys & set(keyed))
+            if not keyed[name]
+        ]
+    )
+
+
+def _keys(conn: Any, table: str) -> dict[str, bool]:
+    """The foreign keys a table carries, each with whether it has been checked
+    against every row. In the schema statements resolve through, for the
+    reason `drift` asks about columns that way."""
+    with cursor(conn) as cur:
+        cur.execute(
+            "select c.conname, c.convalidated from pg_constraint c"
+            " join pg_class r on r.oid = c.conrelid"
+            " join pg_namespace n on n.oid = r.relnamespace"
+            " where c.contype = 'f' and r.relname = %s"
+            " and n.nspname = current_schema()",
+            [table],
+        )
+        return {row[0]: bool(row[1]) for row in cur.fetchall()}

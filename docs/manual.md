@@ -1,11 +1,12 @@
 # The dray manual
 
-dray is a record layer for Amazon Aurora DSQL, built out of what DSQL doesn't
-have. No foreign keys, no savepoints, no locks to take, three thousand rows to
-a transaction. The limits are the design rather than obstacles to route around.
+dray is a record layer for Amazon Aurora DSQL, built out of how DSQL works. No
+savepoints, no locks to take, three thousand rows to a transaction, and a
+commit that can be refused. The limits are the design rather than obstacles to
+route around.
 
 You can already run SQLAlchemy or Django against DSQL — AWS ships adapters for
-both — but you spend the time talking them out of foreign keys, pessimistic
+both — but you spend the time talking them out of savepoints, pessimistic
 locking and heap storage. dray assumes none of those to begin with.
 
 This is the whole of it, and it is written to be read from the top: each section
@@ -441,36 +442,115 @@ class Note:
 read them and take new ones. A child can hang off more than one kind of record,
 which is why adding a record type costs no migration.
 
-> **What DSQL is doing.** There are no foreign keys, so a child has nothing to
-> point at one parent row with. Each kind of child is one table instead, carrying
-> its parent's type and its key in ordinary columns — which is how `note` serves
-> people and events alike, and why the record type you add next week is already
-> served by it. The second of those columns is typed as the key it holds, so the
-> records sharing one child table have to be keyed alike — which every record
-> here is, since each leaves its id to dray. *The names dray owns* is where that
-> stops being automatic.
+> **What DSQL is doing.** A foreign key names one table, and a child here may
+> hang off several kinds of record. So each kind of child is one table carrying
+> its parent's type and its key in ordinary columns, with no key declared
+> between them — which is how `note` serves people and events alike, and why
+> the record type you add next week is already served by it. The second of
+> those columns is typed as the key it holds, so the records sharing one child
+> table have to be keyed alike — which every record here is, since each leaves
+> its id to dray. *The names dray owns* is where that stops being automatic.
 
 Gone when it goes is literal: `person.delete()` takes the notes with it, in the
 same transaction.
 
-> **What DSQL is doing.** There are no foreign keys, so nothing in the database
-> removes a child when its parent goes, and there is no cascade to declare. Roll
-> your own and you are remembering that at every place a person is deleted.
-> Declare it as a child and the declaration remembers for you, in the same
-> transaction as the parent.
+> **What DSQL is doing.** With no key between a child and its parent, nothing
+> in the database removes a child when its parent goes, and there is no cascade
+> to declare. Roll your own and you are remembering that at every place a
+> person is deleted. Declare it as a child and the declaration remembers for
+> you, in the same transaction as the parent.
 
 Children are the only thing that goes with it. A field holding another record's
-id is an ordinary field and dray reads nothing into it — an `organiser_id` on an
-event is a `UUID` that happens to be an id, declared `UUID | None` like any other
+id is an ordinary field unless it says otherwise — an `organiser_id` on an event
+is a `UUID` that happens to be an id, declared `UUID | None` like any other
 field, and given `converter=as_uuid` if the ids reach you as text from a form or
 a URL. `as_uuid` is supplied and takes a `UUID` or the text of one; *Converting
-what arrives*, further down, is why it is dray's rather than yours. So nothing
-checks that the field names a person when you write it, nothing stops that person
-being deleted afterwards, and nothing goes looking for the event when they are.
-Deleting a record leaves everything that mentioned it holding an id that no
-longer resolves, and finding those is yours to do at the point you delete. There
-is nowhere for dray to make it otherwise: with no foreign keys, a check before
-the write would not survive a delete a moment later.
+what arrives*, further down, is why it is dray's rather than yours. Left at
+that, nothing checks that the field names a person when you write it, and
+nothing stops that person being deleted afterwards.
+
+### A field that names another record
+
+`references=` is how a field says otherwise:
+
+```python
+@record(table="event", collection="events")
+class Event:
+    name: str
+    organiser_id: UUID | None = field(default=None, references=Person)
+```
+
+Two things that were silent are now refused, and by the database rather than
+by a read dray made first:
+
+```python
+store.events.add(Event(name="Open day", organiser_id=uuid4()))
+# ReferenceNotFound: Event.organiser_id holds a key no Person has.
+
+store.people.delete(ernest)
+# StillReferenced: Person is still named by Event.organiser_id, and was not
+# removed. Give the records naming it another, or none, and try again.
+```
+
+The first is an id that resolves to nothing, caught on the `add` or the `save`
+that would have written it. The second is the delete that would have left
+events pointing at nobody. A field holding `None` names nobody and is always
+taken.
+
+**Refusing is all it does.** A person who is still named cannot be deleted
+until the events name somebody else, or nobody, and doing that is yours: find
+them, change them, then delete. Nothing is cleared for you and nothing is
+taken with the person — that is what a child is for, and a child is the
+declaration to reach for where one record cannot outlive another.
+
+Both carry what to act on. `record` and `field` are the class and the field
+doing the naming, and `references` the class named:
+`store.events.find(equals={"organiser_id": ernest.id})` is the events in the
+way. The record named can be one of the children going with a delete rather
+than the record you handed over, and `references` is how to tell.
+
+**Rows go in the order you hand them over**, and the database checks each as
+it arrives. So a record names one that is already there, or one earlier in
+the same call:
+
+```python
+store.people.add_all([boss, report])      # report.manager_id = boss.id
+store.people.add_all([report, boss])      # ReferenceNotFound
+```
+
+The same holds for children queued on one parent, which are written in the
+order they were queued. Two new records that name each other cannot go in
+one call either way round: add one naming nobody, add the other, then save
+the first.
+
+> **What DSQL is doing.** This is a foreign key, `event.organiser_id` to
+> `person.id`, and the cluster keeps it without a lock. It checks the person
+> is there when the event is written, and where an event is added while its
+> organiser is being deleted it refuses whichever of the two commits second.
+> dray runs that one again, and it ends as the refusal that describes it: the
+> add told the organiser is gone, or the delete told somebody still names
+> them. Saving the person at the same moment as adding the event conflicts
+> with nothing.
+
+**The field is indexed, whether you ask or not.** Deleting a person means
+asking whether any event names them, and without an index on `organiser_id`
+that is a read of every event there is. Measured on a cluster with 20,000
+events, deleting one person nobody named read fifteen hundred times as much
+with no index as with one. So dray declares `index("organiser_id")` for you
+unless an index of yours already leads with the field — one over every row,
+since an index with a `where=` answers for some of them — and it is one of
+the table's twenty-three like any other.
+
+Three things it will not take. A field stored in the blob, since a key points
+from a column. A field whose type is not the type of the other record's key —
+a `str` naming a record keyed by `UUID`. And a child table's own two parent
+columns, which name several kinds of record at once.
+
+A record declared further down the file is named by its class name instead,
+`references="Person"`, and a record may name its own kind: `manager_id` on a
+person, naming a person. The name is looked up the first time a statement
+needs it and kept, so it wants to be the only class of that name declared by
+then.
 
 New children are queued on the parent and written by its save, so a note and the
 change it explains land in one transaction:
@@ -690,8 +770,8 @@ takes that note's attachments and leaves the ones next to it. There is no depth
 at which this stops — a child names its immediate parent and nothing counts how
 far down it is.
 
-> **What DSQL is doing.** No foreign keys, so nothing in an attachment's row
-> says which person it belongs to — only which note. Deleting the person means
+> **What DSQL is doing.** Nothing in an attachment's row says which person it
+> belongs to — only which note. Deleting the person means
 > reaching the attachments through the notes, which dray does with one statement
 > per generation, deepest first. Every row counts against the 3,000: fifty notes
 > with twenty attachments each is a thousand rows for one person, and a delete
@@ -1792,6 +1872,7 @@ What each costs and buys:
 | what the database holds a value to | the column's type | nothing, unless you add a `check` of your own |
 | what the planner knows about it | statistics kept for the column | a fixed guess, until the field is indexed |
 | what a row stores | the value | the value and the field's name |
+| naming another record, with `references=` | yes | no |
 | what a write rewrites | the row | the row, and the document whole whenever any field in it moves |
 
 Two of those are worth a sentence more. The first row is the one particular to
@@ -4144,7 +4225,7 @@ as refuse.
 
 ## When it goes wrong
 
-dray raises ten things, and they are the ones you can write an `except` for
+dray raises twelve things, and they are the ones you can write an `except` for
 without knowing which database is underneath. **Every one of them is a
 `DrayError`**, so a request handler that turns any refusal into a 400, or a job
 that logs and moves on, catches the one name rather than listing them — and
@@ -4178,7 +4259,7 @@ is the ordinary one — the particular before the general — and it is worth
 saying here only because these bases are dray's doing rather than yours: the
 ladder that goes wrong is one written entirely out of dray's own names, by
 somebody who read the paragraph above and took it as an unmixed kindness.
-`dray.DrayError` catches all ten and belongs at the bottom for the same
+`dray.DrayError` catches all twelve and belongs at the bottom for the same
 reason.
 
 
@@ -4188,6 +4269,8 @@ reason.
 | `RecordNotFound` | `by_id` found nothing, on a collection or a child, or a save or a delete found no row |
 | `RecordHasChanged` | the etag did not match — somebody wrote the row first, or removed it. `ids` and `records` say which |
 | `DuplicateRecord` | a unique constraint refused an insert — `columns` and `constraint` say which |
+| `ReferenceNotFound` | a field with `references=` held a key no such record has — `field` says which |
+| `StillReferenced` | a delete was refused because another record still names this one, or a child going with it — `record` and `field` say which |
 | `CommitRefused` | DSQL refused the commit of a block you opened, and dray does not replay those |
 | `AfterCommitFailed` | the rows committed and an `after_commit` handler then raised |
 | `ConcurrencyExhausted` | DSQL refused the same write five times running over its rows or twenty over the schema, or a `@replaying` function as many times as it was given or twenty over the schema |
@@ -4376,6 +4459,39 @@ One statement per entry, because DSQL takes a single DDL statement per
 transaction. Each is written `if not exists`, because DDL and the row recording
 that it ran cannot commit together, so a migration has to survive being run
 twice.
+
+**A record that names another has to be made after it.** The key in its
+`create table` names a table, and the statement is refused while that table
+is not there. `store.create(Event, Person)` puts them in the order that works
+whatever order they were given in; statements you run yourself are yours to
+order.
+
+Two records that name each other cannot both go first. `store.create` makes
+one without its key and adds it once both tables exist. By hand that is
+`schema.statements(Person, without=["home_event_id"])`, then the other
+record's statements, then `schema.references(Person)` for the key left out.
+
+**On a table that already has rows, a key is added in two steps:**
+
+```python
+for statement in schema.references(Event):
+    print(statement)
+
+# alter table event add constraint event_organiser_id_fk
+#     foreign key (organiser_id) references person (id) not valid
+# alter table async event validate constraint event_organiser_id_fk
+```
+
+The first holds every write from then on to the rule and looks at no row
+already there, which is the only form a cluster takes on a table that exists.
+The second is a job that checks the rows that were there, and it fails on the
+first one naming a record that has gone — so the events pointing at nobody
+have to be found and put right before it will pass. `schema.drift` reports a
+key the class declares and the table does not have, and one that was added
+and never checked against the rows already there.
+
+`store.create` does not do this for you. Like everything else it makes, a
+table that is already there is left as it is.
 
 Which is most of what a migration runner is for, so what you run these with is
 open. AWS publish a Flyway plugin for DSQL that handles the awkward parts — a

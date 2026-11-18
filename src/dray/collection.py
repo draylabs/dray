@@ -1353,8 +1353,13 @@ class Collection:
     def delete(self, record: Any) -> None:
         """Remove a record and everything hanging off it, in one transaction.
 
-        DSQL has no foreign keys and so no cascade of its own; this is the only
-        thing standing between the caller and orphaned rows.
+        Nothing in the database ties a child to its parent, so there is no
+        cascade there to do it; this is the only thing standing between the
+        caller and orphaned rows.
+
+        Raises `StillReferenced` where another record names this one, or one
+        of the children going with it, in a field declared `references=` —
+        and removes nothing.
 
         A `@before_delete` on the record runs inside that transaction, so what
         it writes lands with the removal and what it refuses leaves the row
@@ -3056,9 +3061,8 @@ def _descendants(cls: type) -> list[tuple[type, ...]]:
     Every kind of record below this one, deepest first, each as the chain of
     classes from the record down to it.
 
-    The chain rather than the class alone, because there is no foreign key and
-    nothing in an attachment's row says which person it belongs to — only which
-    note. Reaching it from the person means going through the note, and the
+    The chain rather than the class alone, because nothing in an attachment's
+    row says which person it belongs to — only which note. Reaching it from the person means going through the note, and the
     chain is what says how.
 
     Classes rather than the table names the delete is written out of, because a
@@ -3085,7 +3089,58 @@ def _descendants(cls: type) -> list[tuple[type, ...]]:
     walk(cls, (cls,), frozenset({cls}))
     # Deepest first, so an attachment goes before the note it hangs off and
     # nothing is orphaned by the row that would have found it being gone.
-    return sorted(found, key=len, reverse=True)
+    return _naming_first(sorted(found, key=len, reverse=True))
+
+
+def _naming_first(chains: list[tuple[type, ...]]) -> list[tuple[type, ...]]:
+    """
+    The generations of a cascade, with one that names another ahead of it.
+
+    Deepest first is the order that finds every row. A field declared
+    `references=` adds a second thing the order has to respect: a phone that
+    names an address has to go before the address does, or the database
+    refuses the address while the phone still names it — a record made
+    undeletable by the order its own children happened to be declared in.
+
+    So a generation waits for the ones below it and for the ones that name it.
+    Where those cannot all be satisfied — two kinds of child naming each other
+    — what is left goes in the order it came, and the database says which key
+    stood in the way.
+    """
+    from dray.model import referenced
+
+    def names(kind: type) -> set[type]:
+        found = set()
+        for name in getattr(kind, "__dray_references__", ()):
+            try:
+                found.add(referenced(kind, name))
+            except TypeError:
+                continue
+        return found - {kind}
+
+    waiting = list(chains)
+    ordered: list[tuple[type, ...]] = []
+    while waiting:
+        for chain in waiting:
+            leaf = chain[-1]
+            held = any(
+                other is not chain
+                and (
+                    # Still below it, to be found through it.
+                    other[: len(chain)] == chain
+                    # Still naming it.
+                    or leaf in names(other[-1])
+                )
+                for other in waiting
+            )
+            if not held:
+                ordered.append(chain)
+                waiting.remove(chain)
+                break
+        else:
+            ordered.extend(waiting)
+            break
+    return ordered
 
 
 def _chains_through(parent: type, cls: type) -> list[tuple[type, ...]]:

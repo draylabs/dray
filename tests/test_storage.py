@@ -19,7 +19,9 @@ from dray import (
     DuplicateRecord,
     RecordHasChanged,
     RecordNotFound,
+    ReferenceNotFound,
     Sql,
+    StillReferenced,
     Store,
     ValidationError,
     Write,
@@ -8972,7 +8974,7 @@ def test_everything_dray_raises_is_a_dray_error(store):
         and thing is not DrayError  # the base is not one of the things raised
     ]
 
-    assert len(raised) == 10, "a new one arrived; it wants a row on the page too"
+    assert len(raised) == 12, "a new one arrived; it wants a row on the page too"
     assert [c for c in raised if not issubclass(c, DrayError)] == []
 
 
@@ -9037,3 +9039,585 @@ def test_a_clash_an_index_can_not_be_read_from_still_says_which_index(store):
     assert str(posted.id) not in str(raised.value), "named a key again"
     assert raised.value.columns is None
     assert raised.value.constraint == "mailed_lower"
+
+
+#
+# A field that names another record
+#
+
+
+def naming():
+    """A person, and an event that names one as its organiser. Declared per
+    test, since each one wants the pair on a database of its own."""
+
+    @record(table="person", collection="people")
+    class Person:
+        name: str = field(default="")
+
+    @record(table="event", collection="events")
+    class Event:
+        name: str = field(default="")
+        organiser_id: UUID | None = field(default=None, references=Person)
+
+    return Person, Event
+
+
+def test_a_field_can_say_it_names_another_record():
+    """A `UUID` that happens to be an id is held to nothing. Said on the
+    field, it is a key in the `create table` — named, so that `drift` can look
+    for it and a violation can be traced back — with nothing about what a
+    delete does, which leaves it refused."""
+    Person, Event = naming()
+
+    assert (
+        "    constraint event_organiser_id_fk foreign key (organiser_id)"
+        " references person (id)"
+    ) in schema.create_table(Event)
+    assert "foreign key" not in schema.create_table(Person)
+
+
+def test_a_write_naming_a_record_that_is_not_there_is_refused(store):
+    """On the way in and on a later save alike, since either can put an id
+    there that resolves to nothing. By the database, so it holds against a
+    person deleted a moment before as well as one that never was."""
+    Person, Event = naming()
+    store.create(Person, Event)
+    ernest = store.people.add(Person(name="Ernest"))
+
+    with pytest.raises(ReferenceNotFound) as refused:
+        store.events.add(Event(name="Open day", organiser_id=uuid4()))
+    assert str(refused.value) == (
+        "Event.organiser_id holds a key no Person has."
+    )
+    assert (refused.value.record, refused.value.field) == (Event, "organiser_id")
+    assert refused.value.references is Person
+    assert isinstance(refused.value, (ValueError,))
+    assert store.events.count() == 0
+
+    day = store.events.add(Event(name="Open day", organiser_id=ernest.id))
+    day.organiser_id = uuid4()
+    with pytest.raises(ReferenceNotFound):
+        day.save()
+    assert store.events.by_id(day.id).organiser_id == ernest.id
+
+
+def test_a_field_naming_nobody_is_taken(store):
+    """`None` is not an id that fails to resolve. An event with no organiser
+    yet is the ordinary case and the reason the field is optional."""
+    Person, Event = naming()
+    store.create(Person, Event)
+
+    store.events.add(Event(name="Unclaimed"))
+    assert store.events.count() == 1
+
+
+def test_a_record_something_still_names_cannot_be_deleted(store):
+    """The delete that would have left events pointing at nobody. Refusing is
+    all dray does about it: the events are found and changed by the caller,
+    and then the delete goes through."""
+    Person, Event = naming()
+    store.create(Person, Event)
+    ernest = store.people.add(Person(name="Ernest"))
+    day = store.events.add(Event(name="Open day", organiser_id=ernest.id))
+
+    with pytest.raises(StillReferenced) as refused:
+        store.people.delete(ernest)
+    assert "Person is still named by Event.organiser_id" in str(refused.value)
+    assert (refused.value.record, refused.value.field) == (Event, "organiser_id")
+    assert store.people.count() == 1
+
+    day.organiser_id = None
+    day.save()
+    store.people.delete(ernest)
+    assert store.people.count() == 0
+
+
+def test_a_refused_delete_takes_back_what_its_handler_wrote(store):
+    """`@before_delete` runs inside the delete's transaction and in front of
+    the statement the database refuses, so what it wrote goes back with the
+    refusal rather than standing for a delete that never happened."""
+
+    @record(table="person", collection="people")
+    class Person:
+        name: str = field(default="")
+
+        @before_delete
+        def log_it(self):
+            self.store.people.add(Person(name=f"deleted {self.name}"))
+
+    @record(table="event", collection="events")
+    class Event:
+        organiser_id: UUID | None = field(default=None, references=Person)
+
+    store.create(Person, Event)
+    ernest = store.people.add(Person(name="Ernest"))
+    store.events.add(Event(organiser_id=ernest.id))
+
+    with pytest.raises(StillReferenced):
+        store.people.delete(ernest)
+
+    assert [p.name for p in store.people.find()] == ["Ernest"]
+
+
+def test_the_field_is_indexed_whether_anybody_asked(store):
+    """Deleting a person means asking whether any event names them, and with
+    no index on the field that is a read of every event there is. So it is
+    declared for the class, like the one over a child's parent — unless an
+    index of the class's own already leads with the field and serves it."""
+    Person, Event = naming()
+    assert schema.create_indexes(Event) == [
+        "create index async if not exists event_organiser_id"
+        " on event (organiser_id)"
+    ]
+
+    @record(table="event", collection="events",
+            indexes=[index("organiser_id", "name")])
+    class Led:
+        name: str = field(default="")
+        organiser_id: UUID | None = field(default=None, references=Person)
+
+    assert schema.create_indexes(Led) == [
+        "create index async if not exists event_organiser_id_name"
+        " on event (organiser_id, name)"
+    ]
+
+    @record(table="event", collection="events",
+            indexes=[index("organiser_id", where={"name": "Open day"})])
+    class Partly:
+        name: str = field(default="")
+        organiser_id: UUID | None = field(default=None, references=Person)
+
+    # An index over some of the events answers for those and no others.
+    assert schema.create_indexes(Partly)[1] == (
+        "create index async if not exists event_organiser_id"
+        " on event (organiser_id)"
+    )
+
+    @record(table="event", collection="events",
+            indexes=[index("organiser_id", unique=True)])
+    class OnePerPerson:
+        organiser_id: UUID | None = field(default=None, references=Person)
+
+    # A unique index is searched like any other, and leads with the field.
+    assert len(schema.create_indexes(OnePerPerson)) == 1
+
+
+def test_tables_are_made_in_the_order_their_keys_need(store):
+    """A key names a table that has to be there. Handed the event first, the
+    `create table` for it would be refused, so the order asked for is not the
+    order used."""
+    Person, Event = naming()
+
+    store.create(Event, Person)
+
+    assert schema.drift(store.conn, Event) == []
+    assert schema.drift(store.conn, Person) == []
+
+
+def test_two_records_that_name_each_other_are_made_and_then_keyed(store):
+    """Neither table can go first carrying its key, so one is made without and
+    given it once both exist. Run twice, because `create` is — and `add
+    constraint` has no `if not exists` to lean on."""
+
+    @record(table="person", collection="people")
+    class Person:
+        home_event_id: UUID | None = field(default=None, references="Event")
+
+    @record(table="event", collection="events")
+    class Event:
+        organiser_id: UUID | None = field(default=None, references=Person)
+
+    store.create(Person, Event)
+    store.create(Person, Event)
+
+    assert schema.drift(store.conn, Person) == []
+    assert schema.drift(store.conn, Event) == []
+    with pytest.raises(ReferenceNotFound):
+        store.people.add(Person(home_event_id=uuid4()))
+    with pytest.raises(ReferenceNotFound):
+        store.events.add(Event(organiser_id=uuid4()))
+
+
+def test_a_record_may_name_its_own_kind(store):
+    """A manager is a person. The table names itself as it is made, so there
+    is nothing to order and nothing to add afterwards."""
+
+    @record(table="person", collection="people")
+    class Person:
+        name: str = field(default="")
+        manager_id: UUID | None = field(default=None, references="Person")
+
+    store.create(Person)
+    boss = store.people.add(Person(name="boss"))
+    store.people.add(Person(name="report", manager_id=boss.id))
+
+    with pytest.raises(ReferenceNotFound):
+        store.people.add(Person(name="adrift", manager_id=uuid4()))
+    with pytest.raises(StillReferenced):
+        store.people.delete(boss)
+
+
+def test_a_key_is_added_to_a_table_that_was_already_there(store):
+    """Two statements, because that is the only way a cluster takes one on a
+    table that exists: held to from now on, and then checked against the rows
+    that were there. The check fails while an event points at nobody, which
+    is the state the key was added to end."""
+
+    @record(table="person", collection="people")
+    class Person:
+        name: str = field(default="")
+
+    @record(table="event", collection="events")
+    class Before:
+        organiser_id: UUID | None = field(default=None)
+
+    store.create(Person, Before)
+    adrift = store.events.add(Before(organiser_id=uuid4()))
+
+    @record(table="event", collection="events")
+    class Event:
+        organiser_id: UUID | None = field(default=None, references=Person)
+
+    assert schema.drift(store.conn, Event) == [
+        "event has no index 'event_organiser_id', which the class asks for",
+        "event has no key 'event_organiser_id_fk', which the class asks for",
+    ]
+    assert schema.references(Event) == [
+        "alter table event add constraint event_organiser_id_fk"
+        " foreign key (organiser_id) references person (id) not valid",
+        "alter table async event validate constraint event_organiser_id_fk",
+    ]
+
+    add, validate = schema.references(Event, asynchronous=False)
+    store.conn.execute(add)
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        store.conn.execute(validate)
+
+    store.conn.execute("delete from event where id = %s", [adrift.id])
+    store.conn.execute(validate)
+    for statement in schema.create_indexes(Event, asynchronous=False):
+        store.conn.execute(statement)
+    assert schema.drift(store.conn, Event) == []
+
+
+def test_what_references_will_not_take():
+    """Each is a `create table` the database refuses, or a key that could not
+    mean what it says, found on the line that declared it."""
+    Person, _ = naming()
+
+    with pytest.raises(ValueError, match="a key points from a column"):
+        field(default=None, references=Person, stored_in="blob")
+
+    with pytest.raises(TypeError, match="takes the record a field names"):
+        field(default=None, references=UUID)
+
+    # The class, and not one of its records.
+    with pytest.raises(TypeError, match="takes the record a field names"):
+        field(default=None, references=Person(name="Ernest"))
+
+    with pytest.raises(TypeError, match="whose key is a UUID"):
+
+        @record(table="event", collection="events")
+        class Event:
+            organiser_id: str | None = field(default=None, references=Person)
+
+    @record(table="event", collection="events")
+    class Later:
+        organiser_id: UUID | None = field(default=None, references="Nobody")
+
+    with pytest.raises(TypeError, match="no record or child of that name"):
+        schema.create_table(Later)
+
+
+def test_a_child_field_can_name_a_record_too(store):
+    """A child's own fields are fields like any other. What it cannot be given
+    a key for is its parent, which may be any of several kinds of record."""
+    Person, _ = naming()
+
+    @record(table="walk", collection="walks")
+    class Walk:
+        name: str = field(default="")
+
+    @child(of=Walk, name="legs", table="leg")
+    class Leg:
+        leader_id: UUID | None = field(default=None, references=Person)
+
+    store.create(Leg, Walk, Person)
+    walk = Walk(name="ridge")
+    walk.legs.add(Leg(leader_id=uuid4()))
+
+    with pytest.raises(ReferenceNotFound) as refused:
+        store.walks.add(walk)
+    assert refused.value.field == "leader_id"
+    assert store.walks.count() == 0
+
+
+def test_a_key_dray_did_not_declare_is_left_as_the_driver_raised_it(store):
+    """One added by hand, under a name dray has never heard of. There is no
+    field to name, so saying anything in dray's words would be a guess."""
+
+    @record(table="person", collection="people")
+    class Person:
+        name: str = field(default="")
+
+    @record(table="event", collection="events")
+    class Event:
+        organiser_id: UUID | None = field(default=None)
+
+    store.create(Person, Event)
+    store.conn.execute(
+        "alter table event add constraint by_hand"
+        " foreign key (organiser_id) references person (id)"
+    )
+
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        store.events.add(Event(organiser_id=uuid4()))
+
+
+def test_a_set_that_names_nobody_partway_says_what_had_landed(
+    store, monkeypatch
+):
+    """A set too big for one transaction is several, and the chunks before the
+    one that was refused are committed. `written` names them, as it does for
+    every other way a set stops partway."""
+    import sys
+
+    monkeypatch.setattr(sys.modules["dray.collection"], "MAX_ROWS", 2)
+    Person, Event = naming()
+    store.create(Person, Event)
+    ernest = store.people.add(Person(name="Ernest"))
+    coming = [Event(name=name, organiser_id=ernest.id) for name in "abcdef"]
+    coming[3].organiser_id = uuid4()
+
+    with pytest.raises(ReferenceNotFound) as refused:
+        store.events.add_all(coming)
+
+    assert refused.value.written == tuple(e.id for e in coming[:2])
+    assert store.events.count() == 2
+
+
+def test_a_child_that_names_its_sibling_goes_first_in_a_cascade(store):
+    """A phone that names an address, both children of one person. Deepest
+    first treats them as equals and takes them in the order they were
+    declared, which is the address first — refused, while the phone still
+    names it. A person nobody could delete, for the order of two decorators."""
+
+    @record(table="person", collection="people")
+    class Person:
+        name: str = field(default="")
+
+    @child(of=Person, name="addresses", table="address")
+    class Address:
+        line: str = field(default="")
+
+    @child(of=Person, name="phones", table="phone")
+    class Phone:
+        address_id: UUID | None = field(default=None, references=Address)
+
+    store.create(Person, Phone, Address)
+    person = Person(name="Ernest")
+    home = Address(line="1 High St")
+    person.addresses.add(home)
+    person.phones.add(Phone(address_id=home.id))
+    store.people.add(person)
+
+    store.people.delete(person)
+
+    assert store.people.count() == 0
+
+
+def test_a_child_named_from_outside_stops_its_parents_delete(store):
+    """The record named is not the one handed to the delete but one going
+    with it. `references` says so, and nothing is removed: not the note, and
+    not the person above it."""
+
+    @record(table="person", collection="people")
+    class Person:
+        name: str = field(default="")
+
+    @child(of=Person, name="notes", table="note")
+    class Note:
+        body: str = field(default="")
+
+    @record(table="mention", collection="mentions")
+    class Mention:
+        note_id: UUID | None = field(default=None, references=Note)
+
+    store.create(Mention, Person, Note)
+    person = Person(name="Ernest")
+    note = Note(body="one")
+    person.notes.add(note)
+    store.people.add(person)
+    store.mentions.add(Mention(note_id=note.id))
+
+    with pytest.raises(StillReferenced) as refused:
+        store.people.delete(person)
+    assert refused.value.references is Note
+    assert (refused.value.record, refused.value.field) == (Mention, "note_id")
+    assert store.people.count() == 1 and len(person.notes.find()) == 1
+
+    with pytest.raises(StillReferenced):
+        person.notes.clear()
+
+
+def test_a_violation_is_traced_by_its_table_as_well_as_its_name(store):
+    """`a_b` with a field `c`, and `a` with a field `b_c`: the same letters,
+    and one name for two constraints on two tables. Traced by the name alone,
+    a refusal on one is reported as the other's field."""
+
+    @record(table="target", collection="targets")
+    class Target:
+        name: str = field(default="")
+
+    @record(table="a_b", collection="abs")
+    class AB:
+        c: UUID | None = field(default=None, references=Target)
+
+    @record(table="a", collection="as_")
+    class A:
+        b_c: UUID | None = field(default=None, references=Target)
+
+    store.create(Target, AB, A)
+
+    with pytest.raises(ReferenceNotFound) as refused:
+        store.abs.add(AB(c=uuid4()))
+    assert (refused.value.record, refused.value.field) == (AB, "c")
+
+
+def test_a_refusal_dray_cannot_place_goes_up_as_it_came():
+    """Which way round a violation was is read off the start of the message. A
+    server answering in another language starts it some other way, and then
+    either of dray's names is a guess — one of them the opposite of what
+    happened. So is a class declared since over the same table, naming
+    something that does not exist."""
+    from types import SimpleNamespace
+
+    from dray.store import _referring
+
+    @record(table="person", collection="people")
+    class Person:
+        name: str = field(default="")
+
+    @record(table="event", collection="events")
+    class Event:
+        organiser_id: UUID | None = field(default=None, references=Person)
+
+    def refusal(primary):
+        return SimpleNamespace(diag=SimpleNamespace(
+            table_name="event", constraint_name="event_organiser_id_fk",
+            message_primary=primary,
+        ))
+
+    assert isinstance(
+        _referring(refusal('insert or update on table "event" violates …')),
+        ReferenceNotFound,
+    )
+    assert isinstance(
+        _referring(refusal('update or delete on table "person" violates …')),
+        StillReferenced,
+    )
+    assert _referring(refusal("Einfügen oder Aktualisieren in Tabelle …")) is None
+
+    @record(table="event", collection="events")
+    class Later:
+        organiser_id: UUID | None = field(default=None, references="Nobody")
+
+    assert _referring(refusal('insert or update on table "event" …')) is None
+
+
+def test_a_name_is_looked_up_once_and_kept():
+    """`references="Person"` is the latest class of that name when it is first
+    needed. Asked again each time, an unrelated class of the same name
+    declared somewhere else afterwards would move the key to its table."""
+
+    @record(table="event", collection="events")
+    class Event:
+        organiser_id: UUID | None = field(default=None, references="Person")
+
+    @record(table="person", collection="people")
+    class Person:
+        name: str = field(default="")
+
+    assert "references person (id)" in schema.create_table(Event)
+
+    @record(table="legacy_person", collection="legacy_people")
+    class Person:  # noqa: F811 — the second of the name is the point
+        name: str = field(default="")
+
+    assert "references person (id)" in schema.create_table(Event)
+
+
+def test_two_keys_or_an_index_that_come_out_under_one_name_are_refused():
+    """A table cannot carry two constraints of one name, and `create index if
+    not exists` builds nothing over a name that is taken. Both are found where
+    the class is written."""
+
+    @record(table="person", collection="people")
+    class Person:
+        name: str = field(default="")
+
+    long = "organiser_identifier_one_" + "a" * 30
+
+    with pytest.raises(ValueError, match="two fields whose keys dray calls"):
+
+        @record(table="e" * 40, collection="events")
+        class Event:
+            __annotations__ = {long + "a": UUID | None, long + "b": UUID | None}
+            locals()[long + "a"] = field(default=None, references=Person)
+            locals()[long + "b"] = field(default=None, references=Person)
+
+    with pytest.raises(ValueError, match="dray calls the same thing"):
+
+        @record(table="event", collection="events",
+                indexes=[index("organiser", "id")])
+        class Clash:
+            organiser: str = field(default="")
+            id: UUID = field(default_factory=uuid4)
+            organiser_id: UUID | None = field(default=None, references=Person)
+
+
+def test_a_record_whose_own_key_names_another_is_not_indexed_twice():
+    """A profile keyed by the person it belongs to. The key is indexed by being
+    the key, and a second index over the same column is a slot and a write
+    spent on nothing."""
+
+    @record(table="person", collection="people")
+    class Person:
+        name: str = field(default="")
+
+    @record(table="profile", collection="profiles")
+    class Profile:
+        id: UUID = field(default_factory=uuid4, references=Person)
+
+    assert schema.create_indexes(Profile) == []
+    assert "foreign key (id) references person (id)" in schema.create_table(Profile)
+
+
+def test_a_key_added_and_never_checked_is_something_drift_says(store):
+    """The first of the two statements for a table already there, run without
+    the second. Every write since is held to the key and the rows before it
+    may not be — which reads as a table that is right unless something says."""
+
+    @record(table="person", collection="people")
+    class Person:
+        name: str = field(default="")
+
+    @record(table="event", collection="events",
+            indexes=[index("organiser_id")])
+    class Before:
+        organiser_id: UUID | None = field(default=None)
+
+    @record(table="event", collection="events")
+    class Event:
+        organiser_id: UUID | None = field(default=None, references=Person)
+
+    store.create(Person, Before)
+    add, validate = schema.references(Event, asynchronous=False)
+    store.conn.execute(add)
+
+    assert schema.drift(store.conn, Event) == [
+        "event has the key 'event_organiser_id_fk' and has not checked the "
+        "rows that were already there against it"
+    ]
+    store.conn.execute(validate)
+    assert schema.drift(store.conn, Event) == []

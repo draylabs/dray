@@ -52,6 +52,19 @@ PARENT_ID = "parent_id"
 # module is imported and nothing has to be registered by hand.
 RECORDS: dict[str, type] = {}
 
+# Every record and child by the name of its class, for a field that names one
+# declared further down the file — `references="Person"` — and so cannot be
+# handed the class. The latest declaration of a name is the one it finds.
+DECLARED: dict[str, type] = {}
+
+# The key a `references=` field declares, by its table and the name of its
+# constraint, to the class and the field that declared it. A violation comes
+# back from the database naming those two and nothing else dray can rely on,
+# and this is how they are said in the caller's terms. The table as well as
+# the name, because a name is only one of a kind within its table: `a_b` with
+# a field `c` and `a` with a field `b_c` are the same letters.
+REFERENCES: dict[tuple[str, str], tuple[type, str]] = {}
+
 # The one thing a field may not be called, and it is a prefix rather than a list
 # of words. Everything dray keeps on a record lives under it: the second spelling
 # of each member a caller is meant to use, the three it builds and stores a
@@ -1026,6 +1039,7 @@ def field(
     on_add: Callable[[Write], Any] | None = None,
     on_save: Callable[[Write], Any] | None = None,
     derived: Callable[[Write], Any] | None = None,
+    references: type | str | None = None,
 ) -> Any:
     """
     A field that needs saying more than an annotation can.
@@ -1112,12 +1126,40 @@ def field(
     its own means a scale of zero, which rounds away every fractional digit and
     is the opposite of what somebody declaring a size for a rate is asking for.
 
+    `references` says the field holds another record's key, and has the
+    database hold it to that:
+
+        organiser_id: UUID | None = field(default=None, references=Person)
+
+    A write naming a record that is not there raises `ReferenceNotFound`, and
+    deleting a record something still names raises `StillReferenced`. That is
+    all it does — nothing is cleared or removed when the other record goes,
+    and nothing is loaded through it. The class, or the name of the class
+    where it is declared further down the file. `None` names nobody and is
+    always taken.
+
     Everything is keyword-only. A bare `field("planned")` would leave a reader
     guessing which of six things the string was.
     """
     if stored_in not in (COLUMN, BLOB):
         raise ValueError(f"stored_in must be {COLUMN!r} or {BLOB!r}, not {stored_in!r}")
     check_size(precision, scale)
+    if references is not None:
+        if not isinstance(references, str) and not (
+            isinstance(references, type) and hasattr(references, "__dray_table__")
+        ):
+            raise TypeError(
+                f"references= takes the record a field names, or the name of "
+                f"its class where that is declared further down, not "
+                f"{references!r}."
+            )
+        if stored_in == BLOB:
+            raise ValueError(
+                "references= is a key from this field to another record, and "
+                "a key points from a column. A field stored in the blob has "
+                'none: drop stored_in="blob", or leave the field naming '
+                "whatever it likes."
+            )
 
     # Frozen at the declaration so what a field accepts cannot move underneath
     # it. Mutating the collection that was handed in used to change the
@@ -1179,6 +1221,7 @@ def field(
         "on_add": on_add,
         "on_save": on_save,
         "derived": derived,
+        "references": references,
     }
     if default_factory is not MISSING:
         return dataclasses.field(default_factory=default_factory, metadata=metadata)
@@ -1859,6 +1902,117 @@ def _covered(built: type, one: Index) -> Index:
     return dataclasses.replace(one, where=tuple(sorted(pairs.items())))
 
 
+def _named_apart(built: type, indexes: Sequence[Index]) -> None:
+    """Refuse two indexes on one class that dray would call the same thing.
+
+    Asked twice while a class is built: of the indexes it declared, and again
+    once the ones dray adds for its `references=` fields are among them, since
+    one of those can land on a name a declared index already has."""
+    from dray.schema import _index_name
+
+    # Asked of the one function that names an index, rather than of a second
+    # copy of the rule here. The whole failure below is a name generated one way
+    # and stored another, and two places building it is how that starts again.
+    named: dict[str, Index] = {}
+    for one in indexes:
+        called = _index_name(built, one)
+        if called in named:
+            first, second = _as_written(named[called]), _as_written(one)
+            if one.where is not None:
+                raise ValueError(
+                    f"{built.__name__} declares two indexes that dray calls "
+                    f"the same thing: {first} and {second} are both "
+                    f"{called!r}. They cover the same columns and say the "
+                    "same thing about which rows, so the statement for the "
+                    "second — `create index if not exists` — finds the first "
+                    "and succeeds having built nothing. Drop one of them."
+                )
+            raise ValueError(
+                f"{built.__name__} declares two indexes that dray calls the "
+                f"same thing: {first} and {second} are both "
+                f"{called!r}. An index is named for its table and its columns, "
+                "cut to the 63 bytes an identifier holds, and the statement "
+                "for one is `create index if not exists` — so the second finds "
+                "the first and succeeds having built nothing, leaving the "
+                "class asking for two indexes and the table carrying one. Drop "
+                "the one you do not need, or, where the cut is what brought "
+                "them together, shorten the table name so that the two names "
+                "stay apart."
+            )
+        named[called] = one
+
+
+def referenced(cls: type, name: str) -> type:
+    """
+    The record a `references=` field names, as a class.
+
+    Asked when a statement is written rather than when the class is declared,
+    because a name is allowed to be of a class that comes later. The types are
+    held to each other here for the same reason: a key from a `str` to a
+    `uuid` is a `create table` the database refuses, and saying so against the
+    field is better than passing that on.
+    """
+    rules = cls.__dray_fields__[name]
+    target = rules["references"]
+    if isinstance(target, str):
+        found = DECLARED.get(target)
+        if found is None:
+            raise TypeError(
+                f"{cls.__name__}.{name} references {target!r}, and no record "
+                "or child of that name has been declared. It is the name of "
+                "the class, and the module declaring it has to have been "
+                "imported."
+            )
+        # Kept, so that the name is looked up once. Asked again each time, a
+        # class of the same name declared somewhere else afterwards would
+        # move the key to a table nobody meant.
+        rules["references"] = target = found
+    mine = base_type(cls.__dray_annotations__.get(name))
+    theirs = base_type(target.__dray_annotations__.get(target.__dray_key__))
+    if mine is not theirs:
+        raise TypeError(
+            f"{cls.__name__}.{name} is a {getattr(mine, '__name__', mine)} and "
+            f"references {target.__name__}, whose key is a "
+            f"{getattr(theirs, '__name__', theirs)}. A field naming a record "
+            "holds that record's key, so the two are one type."
+        )
+    return target
+
+
+def _declared_references(built: type, specs: Mapping[str, Any]) -> tuple:
+    """
+    The fields of a class that name another record, checked as far as they can
+    be while the class is being built.
+
+    A class named by a string may not exist yet, so only one handed over as a
+    class is held to its type here; `referenced` does the rest when a
+    statement needs it. Each is put down under the name its constraint will
+    have, which is the only thing a violation says about itself.
+    """
+    from dray.schema import _reference_name
+
+    names = tuple(
+        name for name, rules in specs.items() if rules.get("references") is not None
+    )
+    called: dict[str, str] = {}
+    for name in names:
+        if not isinstance(specs[name]["references"], str):
+            referenced(built, name)
+        constraint = _reference_name(built, name)
+        if constraint in called:
+            raise ValueError(
+                f"{built.__name__} declares two fields whose keys dray calls "
+                f"the same thing: {called[constraint]!r} and {name!r} are "
+                f"both {constraint!r}. A key is named for its table and its "
+                "field, cut to the 63 bytes an identifier holds, and a table "
+                "cannot carry two constraints of one name. Shorten one of "
+                "the field names, or the table's."
+            )
+        called[constraint] = name
+        REFERENCES[(built.__dray_table__, constraint)] = (built, name)
+    return names
+
+
 def _declared_indexes(built: type, given: Any) -> tuple:
     """
     The indexes a decorator was handed, held to the class that has to carry
@@ -1977,36 +2131,7 @@ def _declared_indexes(built: type, given: Any) -> tuple:
                 "or, where both reads matter, order the wider one's columns so "
                 "that it does not lead with the narrower one's."
             )
-    # Asked of the one function that names an index, rather than of a second
-    # copy of the rule here. The whole failure below is a name generated one way
-    # and stored another, and two places building it is how that starts again.
-    named: dict[str, Index] = {}
-    for one in declared:
-        called = _index_name(built, one)
-        if called in named:
-            first, second = _as_written(named[called]), _as_written(one)
-            if one.where is not None:
-                raise ValueError(
-                    f"{built.__name__} declares two indexes that dray calls "
-                    f"the same thing: {first} and {second} are both "
-                    f"{called!r}. They cover the same columns and say the "
-                    "same thing about which rows, so the statement for the "
-                    "second — `create index if not exists` — finds the first "
-                    "and succeeds having built nothing. Drop one of them."
-                )
-            raise ValueError(
-                f"{built.__name__} declares two indexes that dray calls the "
-                f"same thing: {first} and {second} are both "
-                f"{called!r}. An index is named for its table and its columns, "
-                "cut to the 63 bytes an identifier holds, and the statement "
-                "for one is `create index if not exists` — so the second finds "
-                "the first and succeeds having built nothing, leaving the "
-                "class asking for two indexes and the table carrying one. Drop "
-                "the one you do not need, or, where the cut is what brought "
-                "them together, shorten the table name so that the two names "
-                "stay apart."
-            )
-        named[called] = one
+    _named_apart(built, declared)
     return declared
 
 
@@ -2312,6 +2437,23 @@ def _declare(
     # class ended up with — dray's own parent columns included, which are added
     # in this function rather than declared.
     built.__dray_indexes__ = _declared_indexes(built, indexes)
+    built.__dray_references__ = _declared_references(built, specs)
+    # An index over each of them that nothing already leads with. The database
+    # answers a delete of the other record by asking whether any row here
+    # still names it, and with no index that question reads every row there
+    # is — so the index is not left to be remembered, any more than the one
+    # over a child's parent is.
+    built.__dray_indexes__ += tuple(
+        Index((name,))
+        for name in built.__dray_references__
+        # The record's own key is indexed already, by being the key.
+        if name != key
+        and not any(
+            one.where is None and str(one.columns[0]) == name
+            for one in built.__dray_indexes__
+        )
+    )
+    _named_apart(built, built.__dray_indexes__)
     # The blob fields some index is over or about, which are the ones a filter
     # has to be sent a second way to reach. Worked out once, here, because a
     # read asks on every call.
@@ -2424,6 +2566,7 @@ def _declare(
 
     if collection:
         RECORDS[collection] = built
+    DECLARED[built.__name__] = built
     return built
 
 

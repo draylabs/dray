@@ -279,16 +279,18 @@ def test_a_child_set_offers_only_the_calls_a_caller_makes():
     ]
 
 
-def test_the_schema_module_offers_the_six_the_manual_sends_you_to():
-    """`sql_type`, `columns`, `constraint` and `index_columns` are how those six
-    are built rather than calls to make, so somebody reading `dir(dray.schema)`
-    for the way to create a table had ten names to choose between."""
+def test_the_schema_module_offers_the_seven_the_manual_sends_you_to():
+    """`sql_type`, `columns`, `constraint` and `index_columns` are how those
+    seven are built rather than calls to make, so somebody reading
+    `dir(dray.schema)` for the way to create a table had eleven names to choose
+    between."""
     assert made_in(schema) == [
         "create_indexes",
         "create_namespace",
         "create_table",
         "drift",
         "promote",
+        "references",
         "statements",
     ]
 

@@ -19,7 +19,7 @@ from psycopg.pq import TransactionStatus
 from psycopg.rows import tuple_row
 
 from dray.caching import Cache, Caches
-from dray.model import RECORDS, DrayError, key_of
+from dray.model import RECORDS, REFERENCES, DrayError, key_of
 from dray.watching import KINDS, UNWATCHED, Seen, Span, Watch
 
 
@@ -218,6 +218,88 @@ def _clash(cls: type, record: Any, error: Any) -> "DuplicateRecord":
     else:
         message = f"{cls.__name__} refused by a unique index"
     return DuplicateRecord(message, columns=columns, constraint=constraint)
+
+
+class ReferenceNotFound(DrayError, ValueError):
+    """
+    A field declared `references=` was written holding a key no such record
+    has.
+
+    A `ValueError`, like the other ways a value is refused: what is wrong is
+    what the field was given. `record` is the class the field is on, `field`
+    its name and `references` the class it names. The value is left out of
+    the message for the reason a `DuplicateRecord` leaves its own out, and is
+    on the driver's error this is raised from.
+
+    Rows are written in the order they were handed over, so in a set this is
+    also what a record gets for naming one further along in the same call.
+    """
+
+    record: type | None = None
+    field: str | None = None
+    references: type | None = None
+
+
+class StillReferenced(DrayError, RuntimeError):
+    """
+    A delete was refused because a record it would have removed is still
+    named by another.
+
+    `record` and `field` are the class and the field doing the naming, and
+    `references` the class being named — which is the record handed to the
+    delete, or one of its children going with it. That is where to look: find
+    the records holding the key there, give them another or none, and delete
+    again. dray does neither for you.
+    """
+
+    record: type | None = None
+    field: str | None = None
+    references: type | None = None
+
+
+def _referring(error: Any) -> DrayError | None:
+    """
+    A foreign key the database refused, said in the caller's terms, or `None`
+    where dray cannot say it truthfully.
+
+    By the table and the constraint's name, which are the things the error
+    carries that dray chose. Which way round it was — a write holding a key
+    nobody has, or a delete of somebody still named — is read off the start of
+    the message, since both arrive as the same error about the same
+    constraint. A message that starts neither way is a server not speaking
+    English, and goes up as the driver raised it: either of dray's two names
+    would be a guess, and one of them would be the opposite of what happened.
+    """
+    from dray.model import referenced
+
+    diag = getattr(error, "diag", None)
+    known = REFERENCES.get(
+        (getattr(diag, "table_name", None), getattr(diag, "constraint_name", None))
+    )
+    if known is None:
+        return None
+    cls, name = known
+    try:
+        target = referenced(cls, name)
+    except TypeError:
+        # A class declared since over the same table, naming something that
+        # is not there to be named. The refusal is the news, not that.
+        return None
+    said = getattr(diag, "message_primary", None) or str(error)
+    if said.startswith("update or delete"):
+        telling: DrayError = StillReferenced(
+            f"{target.__name__} is still named by {cls.__name__}.{name}, and "
+            "was not removed. Give the records naming it another, or none, "
+            "and try again."
+        )
+    elif said.startswith("insert or update"):
+        telling = ReferenceNotFound(
+            f"{cls.__name__}.{name} holds a key no {target.__name__} has."
+        )
+    else:
+        return None
+    telling.record, telling.field, telling.references = cls, name, target
+    return telling
 
 
 class Unavailable(DrayError, psycopg.InternalError):
@@ -520,6 +602,48 @@ def _schema_exhausted(work: Callable, times: int) -> ConcurrencyExhausted:
     return gone
 
 
+def _referenced_first(
+    records: Sequence[type],
+) -> tuple[list[type], list[tuple[type, str]]]:
+    """
+    Records in an order their tables can be made in, and the keys that order
+    cannot honour.
+
+    A table carrying a key has to come after the table the key names. So each
+    record goes after the ones it names, where those are among the records
+    asked for — one that is not is taken to be there already. A key back to a
+    record still being placed is a ring, which no order satisfies: it is left
+    out and handed back, to be added once every table exists. A record naming
+    its own kind is not one of those, since a table may name itself as it is
+    made.
+    """
+    from dray.model import referenced
+
+    asked = list(dict.fromkeys(records))
+    ordered: list[type] = []
+    late: list[tuple[type, str]] = []
+    placing: list[type] = []
+
+    def place(cls: type) -> None:
+        if cls in ordered:
+            return
+        placing.append(cls)
+        for name in cls.__dray_references__:
+            target = referenced(cls, name)
+            if target is cls or target not in asked:
+                continue
+            if target in placing:
+                late.append((cls, name))
+                continue
+            place(target)
+        placing.pop()
+        ordered.append(cls)
+
+    for cls in asked:
+        place(cls)
+    return ordered, late
+
+
 def replaying(attempts: Any = ATTEMPTS) -> Callable:
     """
     Run this function of yours again when DSQL refuses what it wrote.
@@ -679,6 +803,16 @@ def explaining(conn: psycopg.Connection, *, theirs: bool = False) -> Iterator[No
         # Said already, one level down: a write that got its `begin` in and then
         # lost the connection would otherwise be told the same thing twice.
         raise
+    except psycopg.errors.ForeignKeyViolation as error:
+        # Here rather than at each write, because a key is refused wherever a
+        # statement meets it: an `add`, a `save`, a child's row, a delete, and
+        # SQL of the caller's own where it goes through dray or runs inside a
+        # block dray opened. One whose constraint dray did not declare goes up
+        # as the driver raised it.
+        telling = _referring(error)
+        if telling is None:
+            raise
+        raise telling from error
     except psycopg.InternalError as error:
         if not unavailable(error):
             raise
@@ -1805,6 +1939,16 @@ class Store:
         a migration — this is not a migration runner and does not pretend to be
         one.
 
+        A record that names another with `references=` has its table made
+        after that one, whatever order they were given in, since a key names a
+        table that has to be there. Where two name each other, one of the two
+        keys cannot go into its `create table` and is added once both tables
+        exist.
+
+        A table that is already there is left as it is, as everywhere else in
+        this: one made before its class said `references=` is not given the
+        key here. `schema.drift` reports it and `schema.references` writes it.
+
         The indexes come out in whichever form the connection will take, asked
         once and remembered. `create index async` is DSQL's and nothing else
         accepts it; plain `create index` is everything else's and DSQL does not.
@@ -1815,12 +1959,33 @@ class Store:
         from dray import schema
 
         self.serves(*records)
-        for cls in records:
+        ordered, late = _referenced_first(records)
+        for cls in ordered:
             # One statement at a time, and no commit: the connection is
             # autocommit, so each lands on its own — which is also the only way
             # DSQL will take DDL.
-            for statement in schema.statements(cls, asynchronous=self.dsql):
+            without = {name for owner, name in late if owner is cls}
+            for statement in schema.statements(
+                cls, asynchronous=self.dsql, without=without
+            ):
                 self._ddl(statement)
+        # The keys two tables have to each other, now that both are there.
+        # Asked for first because `add constraint` has no `if not exists`, and
+        # this has to survive being run twice like everything above it. Then
+        # checked against the rows, which on tables just made is nothing to
+        # check and still what leaves the key in the state one made with its
+        # table is in.
+        for cls, name in late:
+            called = schema._reference_name(cls, name)
+            if called in schema._keys(self.conn, cls.__dray_table__):
+                continue
+            add, validate = (
+                statement
+                for statement in schema.references(cls, asynchronous=self.dsql)
+                if f" {called}" in statement
+            )
+            self._ddl(add)
+            self._ddl(validate)
 
     @retrying
     def _ddl(self, statement: str) -> None:

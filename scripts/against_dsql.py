@@ -1079,6 +1079,166 @@ def _blob_indexes(pool: Pool, table: str) -> str:
     )
 
 
+@check("references")
+def _references(pool: Pool, table: str) -> str:
+    """
+    That a field naming another record is held to it, by a cluster.
+
+    Local PostgreSQL has had foreign keys for ever, so the suite shows the two
+    refusals and nothing about the parts that are a cluster's own. That it
+    takes the key in a `create table` at all, under the name dray gave it.
+    That what it raises names that constraint, which is how dray says which
+    field — and begins the way dray reads to tell a write naming nobody from a
+    delete of somebody still named. That `drift` can find the key where a
+    cluster keeps it. That a key is added to a table already there in the two
+    steps the page gives, and the second is a job that fails on a row naming
+    nobody.
+
+    And the race, which is the part that needs no lock to be true. A person
+    deleted while an event naming them is added: one of the two is refused at
+    commit, dray runs it again, and whichever it was ends as the refusal that
+    describes it, with no event left pointing at nobody.
+    """
+
+    @record(table=table, collection=f"c_{RUN}_named")
+    class Person:
+        name: str = field(default="")
+
+    @record(table=f"{table}_naming", collection=f"c_{RUN}_naming")
+    class Event:
+        name: str = field(default="")
+        organiser_id: uuid.UUID | None = field(default=None, references=Person)
+
+    @record(table=f"{table}_late", collection=f"c_{RUN}_late")
+    class Before:
+        organiser_id: uuid.UUID | None = field(default=None)
+
+    @record(table=f"{table}_late", collection=f"c_{RUN}_late")
+    class Late:
+        organiser_id: uuid.UUID | None = field(default=None, references=Person)
+
+    with pool.store(records=[Person, Event]) as store:
+        # The event first, which is the order a key refuses.
+        store.create(Event, Person)
+        people = getattr(store, f"c_{RUN}_named")
+        events = getattr(store, f"c_{RUN}_naming")
+        drifted = schema.drift(store.conn, Event)
+        if drifted:
+            raise AssertionError(f"drift on a table just created: {drifted}")
+
+        ernest = people.add(Person(name="Ernest"))
+        try:
+            events.add(Event(name="adrift", organiser_id=uuid.uuid4()))
+        except dray.ReferenceNotFound as refused:
+            if refused.field != "organiser_id":
+                raise AssertionError(f"named {refused.field!r}: {refused}")
+        else:
+            raise AssertionError("an event naming nobody was taken")
+
+        day = events.add(Event(name="Open day", organiser_id=ernest.id))
+        try:
+            people.delete(ernest)
+        except dray.StillReferenced:
+            pass
+        else:
+            raise AssertionError("a person an event still names was deleted")
+        day.organiser_id = None
+        day.save()
+        people.delete(ernest)
+
+        # The race, thirty times, on two connections of the pool.
+        ends: dict[str, int] = {}
+
+        def racing() -> None:
+            with pool.store(records=[Person, Event]) as one, pool.store(
+                records=[Person, Event]
+            ) as other:
+                theirs = getattr(one, f"c_{RUN}_named")
+                mine = getattr(other, f"c_{RUN}_naming")
+                person = theirs.add(Person(name="racing"))
+                gate = threading.Barrier(2)
+                said: list[str] = []
+
+                def deleting() -> None:
+                    gate.wait()
+                    try:
+                        theirs.delete(person)
+                        said.append("deleted")
+                    except dray.StillReferenced:
+                        said.append("delete refused")
+
+                def adding() -> None:
+                    gate.wait()
+                    try:
+                        mine.add(Event(name="late", organiser_id=person.id))
+                        said.append("added")
+                    except dray.ReferenceNotFound:
+                        said.append("add refused")
+
+                threads = [
+                    threading.Thread(target=deleting),
+                    threading.Thread(target=adding),
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+                key = " and ".join(sorted(said))
+                ends[key] = ends.get(key, 0) + 1
+
+        for _ in range(30):
+            racing()
+        allowed = {"add refused and deleted", "added and delete refused"}
+        if set(ends) - allowed:
+            raise AssertionError(f"a race ended some other way: {ends}")
+        (orphans,) = store.conn.execute(
+            f"select count(*) from {table}_naming e where organiser_id is not"
+            f" null and not exists (select 1 from {table} p"
+            " where p.id = e.organiser_id)"
+        ).fetchone()
+        if orphans:
+            raise AssertionError(f"{orphans} events left naming nobody")
+
+    # A key added to a table that was there, with a row it will not pass.
+    with pool.store(records=[Person, Before]) as store:
+        store.create(Before)
+        before = getattr(store, f"c_{RUN}_late")
+        adrift = before.add(Before(organiser_id=uuid.uuid4()))
+        add, validate = schema.references(Late)
+        ddl(store.conn, add)
+        job = submitted(store.conn, validate)
+        try:
+            store.conn.execute("call sys.wait_for_job(%s)", [job])
+        except psycopg.Error:
+            pass
+        (status,) = store.conn.execute(
+            "select status from sys.jobs where job_id = %s", [job]
+        ).fetchone()
+        if status != "failed":
+            raise AssertionError(
+                f"validating over a row naming nobody was {status}, not failed"
+            )
+        before.delete(adrift)
+        job = submitted(store.conn, validate)
+        store.conn.execute("call sys.wait_for_job(%s)", [job])
+        (status,) = store.conn.execute(
+            "select status from sys.jobs where job_id = %s", [job]
+        ).fetchone()
+        if status != "completed":
+            raise AssertionError(f"validating over clean rows was {status}")
+        for statement in schema.create_indexes(Late):
+            job = submitted(store.conn, statement)
+            store.conn.execute("call sys.wait_for_job(%s)", [job])
+        drifted = schema.drift(store.conn, Late)
+        if drifted:
+            raise AssertionError(f"drift after adding the key: {drifted}")
+
+    return (
+        "a key made with its table and one added afterwards, both refusals"
+        f" named for the field, and thirty races ending {ends}"
+    )
+
+
 @check("long-index-name")
 def _long_index_name(pool: Pool, table: str) -> str:
     """
@@ -2224,7 +2384,10 @@ def sweep(pool: Pool) -> None:
         for table in tables:
             for attempt in range(10):
                 try:
-                    store.conn.execute(f"drop table if exists {table}")
+                    # `cascade` for the keys between them: a table another
+                    # still names is refused a plain drop, and the order these
+                    # come back in is nobody's.
+                    store.conn.execute(f"drop table if exists {table} cascade")
                     break
                 except psycopg.Error as error:
                     if attempt == 9:

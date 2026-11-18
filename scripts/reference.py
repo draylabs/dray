@@ -171,7 +171,8 @@ DECORATORS = [
     ("@collection", "the vocabulary a record has of its own", "of="),
     ("field()", "what a field will take and what fills it",
      "default= default_factory= stored_in= choices= converter= "
-     "validator= on_add= on_save= on_change= derived= precision= scale="),
+     "validator= on_add= on_save= on_change= derived= precision= scale= "
+     "references="),
     ("index()", "what the table is indexed for", "*columns unique= where="),
 ]
 
