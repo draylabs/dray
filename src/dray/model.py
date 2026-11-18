@@ -668,6 +668,12 @@ def index(
         index("person_id", "event_id", unique=True, where={"state": "open"})
         index("email", unique=True, where=Sql("email is not null"))
 
+    A field stored in the blob is named like any other, in the columns or in a
+    `where=` mapping, where it is a `str`, an `int`, a `bool`, a `date` or a
+    `UUID`. The index is over its text, which those five have one of, and
+    `find` asks in the way that reaches it. An index naming one is never a
+    constraint in the `create table` either.
+
     A mapping is fields and the values they hold, every pair of which has to
     be true of a row for it to take an entry. The names are checked against the
     class, the values go through the field's converter, and `None` means *is
@@ -1208,6 +1214,15 @@ UNINDEXABLE: dict[Any, str] = {
 }
 
 
+# The annotations a field in the blob can be indexed under. An index there is
+# over the value read out of the document as text, so what it can serve is a
+# kind of value with one text and no more: `4.5` and `4.50` are a single
+# `Decimal` and two strings, a `datetime` is one moment in as many spellings as
+# there are time zones, and a `float` is `1` or `1.0` by the writer's taste.
+# These five are written one way by `json.dumps` and `as_text` both.
+BLOB_INDEXABLE = (str, int, bool, date, UUID)
+
+
 def check_indexable(owner: str, name: str, annotation: Any) -> None:
     """
     Whether a column a declared index covers is one DSQL can index. Raises to
@@ -1235,6 +1250,40 @@ def check_indexable(owner: str, name: str, annotation: Any) -> None:
         "What can be indexed is a column beside it holding what the reads "
         "actually match on: a digest as text, a duration in seconds, the one "
         "key lifted out of the document."
+    )
+
+
+def check_blob_indexable(owner: str, name: str, annotation: Any) -> None:
+    """
+    Whether a field in the blob is one an index can be over. Raises to refuse,
+    like `check_indexable`, which is the same question asked of a column.
+
+    Narrower than that one, and for a reason of dray's rather than the
+    database's: the index is over the field's text, and `BLOB_INDEXABLE` is the
+    kinds of value whose text says which value it is.
+    """
+    kind = base_type(annotation)
+    if kind in BLOB_INDEXABLE:
+        return
+    said = getattr(kind, "__name__", None) or str(kind)
+    # Where to send somebody depends on whether a column would be any better.
+    # For three kinds of value it would not be, and saying "give it a column"
+    # there is advice that walks into the next refusal.
+    if kind in UNINDEXABLE:
+        instead = (
+            f"A column of that kind is one DSQL will not index either, so "
+            "what can be indexed is a field beside it holding what the reads "
+            "actually match on."
+        )
+    else:
+        instead = (
+            'Give the field a column by dropping stored_in="blob", which '
+            "indexes it as what it is."
+        )
+    raise ValueError(
+        f"{owner}.{name} is declared {said} and stored in the blob, and an "
+        "index over a field there is over its text — which serves str, int, "
+        f"bool, date and UUID, each written one way only. {instead}"
     )
 
 
@@ -1281,9 +1330,8 @@ def check_numeric(
 
     Two ways it does not. A `Decimal` in the blob is written as its own text and
     comes back whole, so a size there is a promise about rounding that nothing
-    ever keeps — the same shape as an index over a blob field, and answered the
-    same way, by giving the field a column. And every other annotation
-    becomes a column with no size to declare at all.
+    ever keeps, and the answer is to give the field a column. And every other
+    annotation becomes a column with no size to declare at all.
     """
     if base_type(annotation) is not Decimal:
         raise ValueError(
@@ -1685,6 +1733,26 @@ def _as_written(one: Index) -> str:
     return f"index({said})"
 
 
+def indexed_text(value: Any) -> str | None:
+    """
+    A value as `->>` hands it back out of the document, or `None` where that
+    is not something to rely on.
+
+    One function because two things have to agree to the character: the text a
+    predicate is written with, and the text a filter is sent with to reach an
+    index over the same field. By the type itself — a member of a `str` enum is
+    not written the way a `str` is.
+    """
+    kind = type(value)
+    if kind is bool:
+        return "true" if value else "false"
+    if kind is date:
+        return value.isoformat()
+    if kind in (str, int, UUID):
+        return str(value)
+    return None
+
+
 # What a value in a `where=` mapping may be, which is what `schema` knows how
 # to write into a statement. A `create index` takes no parameters, so the value
 # is text in it, and each kind admitted here is one more way of quoting that
@@ -1715,14 +1783,12 @@ def _covered(built: type, one: Index) -> Index:
                 f"{name!r} is {value!r}, and declares no such field. Name a "
                 "field it has, or write the predicate as Sql(...)."
             )
-        if name in built.__dray_blob__:
-            raise TypeError(
-                f"{built.__name__} has an index over the rows where "
-                f"{name!r} is {value!r}, and that field is stored in the "
-                "blob. A mapping names fields with a column of their own, the "
-                "same as the columns an index covers. Give it one by dropping "
-                'stored_in="blob", or write the predicate as Sql(...) and '
-                "spell the document out yourself."
+        inside = name in built.__dray_blob__
+        # Not asked of a field the predicate only wants absent. `is null` is
+        # true or false of any kind of value, with no text to get right.
+        if inside and value is not None:
+            check_blob_indexable(
+                built.__name__, name, built.__dray_annotations__.get(name)
             )
         if isinstance(value, (AnyOf, NoneOf)):
             raise TypeError(
@@ -1743,6 +1809,13 @@ def _covered(built: type, one: Index) -> Index:
         # The type itself and nothing descended from it. A `datetime` is a
         # `date` and a member of a `str` enum is a `str` as far as `isinstance`
         # goes, and neither is written the way its parent is.
+        if inside and value is not None and indexed_text(value) is None:
+            raise TypeError(
+                f"{built.__name__} has an index over the rows where "
+                f"{name!r} is {value!r}, and {name!r} is stored in the blob, "
+                f"where a {type(value).__name__} is not compared by its text. "
+                "Write the predicate as Sql(...)."
+            )
         if value is not None and type(value) not in PREDICATE_VALUES:
             raise TypeError(
                 f"{built.__name__} has an index over the rows where "
@@ -1824,6 +1897,8 @@ def _declared_indexes(built: type, given: Any) -> tuple:
                 "index(...), which is what carries the columns and whether they "
                 "are unique together."
             )
+    from dray.schema import _index_name, _is_constraint, _predicate
+
     declared = tuple(
         _covered(built, one) if isinstance(one.where, tuple) else one
         for one in declared
@@ -1835,13 +1910,10 @@ def _declared_indexes(built: type, given: Any) -> tuple:
                     f"{built.__name__} is indexed on {str(name)!r}, which it "
                     "does not declare. Add the field, or index something it has."
                 )
-            if name in built.__dray_blob__:
-                raise TypeError(
-                    f"{built.__name__} is indexed on {str(name)!r}, which is "
-                    "stored in the blob and has no column to index. Give it a "
-                    'column by dropping stored_in="blob" — which is what '
-                    "indexing a field means here, since jsonb has no index "
-                    "support on DSQL at all."
+            inside = name in built.__dray_blob__
+            if inside:
+                check_blob_indexable(
+                    built.__name__, name, built.__dray_annotations__.get(name)
                 )
             if isinstance(name, Descending):
                 raise ValueError(
@@ -1857,9 +1929,9 @@ def _declared_indexes(built: type, given: Any) -> tuple:
                     "an index key may say."
                 )
             # Only the kind that goes into a `create table`. One with a
-            # predicate is a statement of its own on either table, and a key
-            # there may say where its empty values go.
-            if one.unique and one.where is None and _nulls(name):
+            # predicate or over the blob is a statement of its own on either
+            # table, and a key there may say where its empty values go.
+            if _is_constraint(built, one) and _nulls(name):
                 raise ValueError(
                     f"{built.__name__} indexes {str(name)!r} with a null "
                     "placement and unique=True together, which dray cannot "
@@ -1871,13 +1943,14 @@ def _declared_indexes(built: type, given: Any) -> tuple:
                     "constraint brings serves the default ordering forwards "
                     "and backwards alike."
                 )
-            check_indexable(built.__name__, name, built.__dray_annotations__.get(name))
+            if not inside:
+                check_indexable(
+                    built.__name__, name, built.__dray_annotations__.get(name)
+                )
 
     # An index is skipped against itself by position rather than by value,
     # because two declarations can be equal — `index("email")` said twice is
     # this same mistake — and skipping by value would take that pair with it.
-    from dray.schema import _index_name, _predicate
-
     for here, narrow in enumerate(declared):
         # A unique index is never the redundant one. It enforces something no
         # wider index does, whatever their columns share.
@@ -1890,7 +1963,7 @@ def _declared_indexes(built: type, given: Any) -> tuple:
             # them answers nothing about the rest, and one over all of them is
             # the bigger thing to read for a question about the few — so
             # neither stands in for the other, whatever columns they share.
-            if _predicate(narrow) != _predicate(wider):
+            if _predicate(built, narrow) != _predicate(built, wider):
                 continue
             if wider.columns[: len(narrow.columns)] != narrow.columns:
                 continue
@@ -2239,6 +2312,18 @@ def _declare(
     # class ended up with — dray's own parent columns included, which are added
     # in this function rather than declared.
     built.__dray_indexes__ = _declared_indexes(built, indexes)
+    # The blob fields some index is over or about, which are the ones a filter
+    # has to be sent a second way to reach. Worked out once, here, because a
+    # read asks on every call.
+    built.__dray_blob_indexed__ = frozenset(
+        str(name)
+        for one in built.__dray_indexes__
+        for name in (
+            *one.columns,
+            *(pair[0] for pair in one.where or () if isinstance(one.where, tuple)),
+        )
+        if str(name) in built.__dray_blob__
+    )
     # The whole `order by` a read gets when the call names none, worked out here
     # so a record and a child answer that question the same way. The key on the
     # end of whatever was declared is what makes it total; the key on its own is

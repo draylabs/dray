@@ -32,16 +32,20 @@ class Person:
     suburb: str | None = field(default=None, stored_in="blob")
 ```
 
-Three of those get columns and one does not. `family_name`, `given_names` and
-`status` are what we filter, sort and count on; `suburb` lives in a jsonb blob
-because we only ever read it back out. A plain annotation is a column, and
+Three of those get columns and one does not. A plain annotation is a column, and
 `field()` is the same thing when it needs saying more — a default, a validator,
-something to call when it changes.
+something to call when it changes. `suburb` is kept in the jsonb document every
+record carries, beside whatever else the class puts there.
 
-Adding an attribute is a write rather than a migration. Promoting one to a column
-on the day it turns out to be worth indexing is deleting `stored_in="blob"`, and
-nothing about the field or its callers changes — the rows already written need
-moving across, and *Tables* below hands you the statements for that.
+Which side a field goes is yours to choose and to change. Either can be
+filtered on and either can be indexed; a field in the blob is added by writing
+it, where a column is a change to the table, and a column is sorted on, typed by
+the database and unique from the first row, where a field in the blob is none
+of those. *A column or the blob*, under *Types*, sets the two side by side.
+
+Moving one to a column later is deleting `stored_in="blob"`, and nothing about
+the field or its callers changes — the rows already written need moving across,
+and *Tables* below hands you the statements for that.
 
 > **If you have a type checker on.** The class above is built by a decorator
 > at import, so an editor is told the fields and the constructor and nothing
@@ -97,11 +101,11 @@ store.people.find(equals={"status": "enquiry", "suburb": "Leura"})
 
 Both names in `equals` are filters, and both have to match. Underneath they are
 not alike: `status` is compared as a column, while `suburb` is pulled out of the
-jsonb document first. A column can be indexed and a key inside a shared jsonb
-document cannot — on DSQL `jsonb` carries no index support at all — so which
-side a field lives on decides whether asking about it can ever be cheap.
-Identical at the call site, and which is which is a line in the class you can
-change on the day the scan stops being free.
+jsonb document first. Either can be indexed, though a column takes more kinds of
+value and is the only one of the two that can be sorted on — so which side a
+field lives on decides what asking about it can cost. Identical at the call
+site, and which is which is a line in the class you can change on the day it
+matters.
 
 `find(equals={"suburb": None})` asks for the ones with nothing in that field, on
 either side of the split.
@@ -1660,37 +1664,38 @@ and read back by what the field declared.
 
 Which is the whole of the difference:
 
-| annotation | stored in a column as | indexed | sorted | stored in the blob as |
-|---|---|---|---|---|
-| `str` | `text` | yes | yes | `string` |
-| `int` | `bigint` | yes | yes | `number` |
-| `float` | `double precision` | yes | yes | `number` |
-| `bool` | `boolean` | yes | yes | `boolean` |
-| `dict`, `list` | `jsonb` | **no** | yes | `object`, `array` |
-| `datetime` | `timestamptz` | yes | yes | `string`, ISO |
-| `date` | `date` | yes | yes | `string`, ISO |
-| `time` | `time` | yes | yes | `string`, ISO |
-| `timedelta` | `interval` | **no** | yes | `string`, seconds |
-| `Decimal` | `numeric(18,6)` | yes | yes | `string` |
-| `UUID` | `uuid` | yes | yes | `string` |
-| `bytes` | `bytea` | **no** | yes | `string`, hex |
+| annotation | stored in a column as | indexed | sorted | stored in the blob as | indexed there |
+|---|---|---|---|---|---|
+| `str` | `text` | yes | yes | `string` | yes |
+| `int` | `bigint` | yes | yes | `number` | yes |
+| `float` | `double precision` | yes | yes | `number` | **no** |
+| `bool` | `boolean` | yes | yes | `boolean` | yes |
+| `dict`, `list` | `jsonb` | **no** | yes | `object`, `array` | **no** |
+| `datetime` | `timestamptz` | yes | yes | `string`, ISO | **no** |
+| `date` | `date` | yes | yes | `string`, ISO | yes |
+| `time` | `time` | yes | yes | `string`, ISO | **no** |
+| `timedelta` | `interval` | **no** | yes | `string`, seconds | **no** |
+| `Decimal` | `numeric(18,6)` | yes | yes | `string` | **no** |
+| `UUID` | `uuid` | yes | yes | `string` | yes |
+| `bytes` | `bytea` | **no** | yes | `string`, hex | **no** |
 
 The storage and the indexing are DSQL's rather than dray's, from [supported
 data
 types](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-postgresql-compatibility-supported-data-types.html),
 which is the source for the whole table and worth reading beside it. Three
 types have a column of their own and still cannot be indexed, so an index over
-a `timedelta`, `bytes`, `dict` or `list` is refused at declaration for the same
-reason it is refused inside the blob: there is nothing there to index, and
+a `timedelta`, `bytes`, `dict` or `list` is refused at declaration, and
 finding that out from the cluster after local PostgreSQL accepted it is the
 worse way to learn it. What the cluster actually says is `datatype bytea is not
 supported in a key`, so the same four annotations are refused as a record's
-`id` — a primary key is a key, and that is one nobody asked for.
+`id` — a primary key is a key, and that is one nobody asked for. The last
+column of the table is dray's own and narrower, and *Indexes, and the one
+unique thing* is where it is explained.
 
 DSQL will sort anything, including the three it will not index, so `order_by`
 takes any field here freely.
 
-One entry in the middle column carries a size, and the size is DSQL's too. A
+One entry in the second column carries a size, and the size is DSQL's too. A
 `numeric` given none is unbounded on local PostgreSQL and `numeric(18,6)` on a
 cluster — eighteen digits, six of them after the point — filled in by DSQL and
 applied when a row is written rather than when the table is made. dray writes
@@ -1770,6 +1775,35 @@ the annotation says. *Where your names live in SQL you wrote*, below.
 `4.990000000000000213`. And a stored value that will not parse is handed back
 as it is, because `load` never raises — a row written before the field was a
 date has to keep loading.
+
+### A column or the blob
+
+Neither is the right answer in general, and a class usually wants some of each.
+What each costs and buys:
+
+| | a column | the blob |
+|---|---|---|
+| adding the field | a change to the table, and on a cluster a transaction open across one can have its commit refused and be run again | a write, and nothing about the table changes |
+| `find` by a value | yes | yes |
+| an index | every kind of value but the three above | `str`, `int`, `bool`, `date`, `UUID` |
+| `order_by` | yes | no |
+| a range or a total, in SQL of your own | compared as its own type | read out as text, and cast by you |
+| `unique=True` | holds from the moment the table exists | holds once its index has built |
+| what the database holds a value to | the column's type | nothing, unless you add a `check` of your own |
+| what the planner knows about it | statistics kept for the column | a fixed guess, until the field is indexed |
+| what a row stores | the value | the value and the field's name |
+| what a write rewrites | the row | the row, and the document whole whenever any field in it moves |
+
+Two of those are worth a sentence more. The first row is the one particular to
+a cluster: a schema change there is a transaction like any other, and one that
+lands while yours is open is a refusal yours meets at commit — replayed for you
+where dray opened it, and yours to run again where you did. And the guess in
+the eighth is a guess about how many rows will match, which is what a join
+order and a choice between two indexes are decided on. It is right for a field
+with an index over it, because the index brings statistics with it.
+
+A field can move from the blob to a column, with the statements under *Promoting
+a field out of the blob*. dray writes nothing to move one back.
 
 ### Things to know
 
@@ -4395,10 +4429,20 @@ takes and held to the class the same way: a name it never declared is refused,
 a converter runs, and `None` means *is null*. Every pair has to hold, and
 equality is all it says. One thing is checked here that a filter is spared — a
 value outside the field's `choices` is refused, since an index over a word the
-field will not take is built and stays empty. Only a field with a column of its
-own can be named, the same rule as the columns an index covers and for the same
-reason, and the value is text, a whole number, a `Decimal`, a `date`, a `UUID`,
-`True` or `False`.
+field will not take is built and stays empty. The value is text, a whole
+number, a `Decimal`, a `date`, a `UUID`, `True` or `False`. A field in the blob
+can be named where it is one of the five kinds that can be indexed there,
+further down this section, or where the value is `None`, and is compared the
+way an index over it is:
+
+```python
+index("family_name", where={"suburb": "Leura"})
+```
+
+```sql
+create index async if not exists person_family_name_4328b9
+    on person (family_name) where data->>'suburb' = 'Leura'
+```
 
 Anything else is SQL, and says that it is:
 
@@ -4474,7 +4518,8 @@ will not take a placement either, and that one is dray's own limit rather than
 the database's: the unique kind goes into a `create table` as a constraint,
 `unique (due_on nulls first)` is not a grammar SQL has, and the two tables dray
 writes for would come out indexed differently with nothing to say so. A unique
-index with a `where=` is never a constraint, and so may say both.
+index with a `where=`, or over a field in the blob, is never a constraint, and
+so may say both.
 
 **A composite mixing directions cannot be indexed at all**, which is worth
 knowing because it is a shape a busy read reaches for. `order by area_id,
@@ -4527,10 +4572,79 @@ is a number a long-lived table reaches — so a record where the *questions* kee
 arriving is one where the answer eventually stops being a field at all. *When the
 questions keep changing* below is where that goes instead.
 
-Only a column can be indexed. A key inside a shared jsonb document has
-nothing to index, so an index naming a field stored in the blob is refused at
-declaration rather than at the database — which is also the sharpest reason to
-give a field a column, and what *Promoting a field out of the blob* below is for.
+**A field in the blob is indexed by naming it, like any other.**
+
+```python
+@record(table="person", collection="people",
+        indexes=[index("suburb")])
+class Person:
+    family_name: str
+    suburb: str | None = field(default=None, stored_in="blob")
+```
+
+```sql
+create index async if not exists person_suburb_0e6019
+    on person ((data->>'suburb'))
+```
+
+Nothing is moved to get it. No column is added and no row rewritten, so a field
+that turns out to be asked about is one statement away from being cheap to ask
+about, on a table of any size.
+
+The index is over the value read out of the document as text, and `find` asks
+in the way that reaches it:
+
+```python
+people.find(equals={"suburb": "Leura"})
+```
+
+```sql
+where data->>'suburb' = $1 and data->'suburb' = $2
+```
+
+The first half is what the index answers. The second is the comparison `find`
+makes on any blob field — value against value, with its type intact — and it
+is the one that decides: a row it takes has the text the first half asks for,
+so the answer is the one a class with no index gets, found by a shorter road.
+`any_of` reaches it the same way.
+
+One row is the exception. A whole number held in the document as `7.0` is 7
+to the second half and is not the text `7` to the first, so a `find` for 7
+through the index passes it by. dray writes an `int` as `7`; the rows that
+hold the other are ones written while the field was a `float`, or by something
+that is not dray. SQL of your own
+reaches it by reading the field as that text, `data->>'suburb'`, which for a
+`str` field is what `sql_for` already writes.
+
+**Five kinds of field can be indexed there: `str`, `int`, `bool`, `date` and
+`UUID`.** Each is written into the document one way only, so its text is as
+good as its value. A `Decimal` is not — `4.5` and `4.50` are one number and two
+texts — and nor is a `datetime`, which is one moment in as many spellings as
+there are time zones. Those are refused where the class is written, along with
+everything a column will not index either, and the answer for them is a column.
+
+That it is text is also why nothing an old row holds can break it. A cast to
+the field's own type would fail the build, and every read after it, on the
+first row holding something else under that key. Reading the key out as text
+fails on nothing.
+
+**A column still buys three things.** An order: `order_by` takes no field in
+the blob, indexed or not. The kinds of value above. And for `unique=True`, a
+rule that holds from the moment the table exists — over a blob field it is
+taken, and like one with a `where=` it is never a constraint in the `create
+table`, so on a cluster it enforces once its build has finished.
+
+Unique over a blob field is unique over its text as well, which is the same
+thing for every row the class wrote and not for one it did not: a document
+holding the text `"8"` under an `int` field refuses an 8, and `find` for 8 does
+not return the row that refused it.
+
+The name ends in six characters here too, `person_suburb_0e6019`, for the reason
+it does with a predicate: the field's name alone no longer says what the index
+is over. Which is what makes promoting the field later come out right. The
+class then asks for `person_suburb`, over the column; `drift` reports it
+missing and the migration builds it; and the index over the document is left
+where it was, covering a key no row carries any more, until you drop it.
 
 Nor will every column take one. A `timedelta`, `bytes`, `dict` or `list` field
 becomes an `interval`, `bytea` or `jsonb` column and DSQL indexes none of the
@@ -4813,6 +4927,16 @@ Change the class first — `promote` refuses a field still declared
 `stored_in="blob"`, because running these before the class changes leaves a
 column nothing writes to. Each survives being run twice, and the two updates skip
 rows that no longer carry the key, so stopping halfway and resuming is safe.
+
+An index that named the field while it was in the blob is over the document,
+and none of these statements touch it. `schema.drift` reports the one the class
+now asks for, over the column, and `schema.create_indexes` writes it. The old
+one is yours to drop once the last of the three has run.
+
+Where that index is unique there is a gap to plan for. A row written after the
+class changed carries nothing under the key, so the index over the document no
+longer sees it, and the one over the column enforces only once it has built.
+Build the new one before the class that writes to the column is deployed.
 
 SQL you wrote has the mirror of the same problem, and it is quieter. A report
 reaching in with `data->>'suburb'` sees only the rows written before the change

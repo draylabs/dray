@@ -51,7 +51,7 @@ from dray import (
     record,
     schema,
 )
-from dray.collection import MAX_ROWS
+from dray.collection import MAX_ROWS, jsonb
 from dray.model import MAX_PRECISION, UNINDEXABLE
 
 CHECKS: list[tuple[str, Callable]] = []
@@ -903,6 +903,169 @@ def _declared_indexes(pool: Pool, table: str) -> str:
     if after != made:
         raise AssertionError(f"the index form built something: {made} then {after}")
     return f"{len(made)} indexes, unique enforcing at once, async form a no-op"
+
+
+@check("blob-indexes")
+def _blob_indexes(pool: Pool, table: str) -> str:
+    """
+    That a field in the blob can be indexed, and that `find` reaches the index.
+
+    Local PostgreSQL builds an index over `(data->>'suburb')` and says nothing
+    of the three things the page rests on. That a cluster builds one at all,
+    where it refuses the document itself as a key. That the statement `find`
+    sends — the text comparison beside the jsonb one, both as parameters — is
+    planned through it, which is the whole reason the first half is sent. And
+    that a unique one refuses a duplicate in words dray can read the field's
+    name back out of.
+
+    The rows written past dray are the ones the two comparisons disagree
+    about on their own: a number under a text field and text under a number
+    field. What comes back has to be what the jsonb comparison alone gives.
+    """
+
+    @record(
+        table=table,
+        collection=f"c_{RUN}_blob",
+        indexes=[
+            index("suburb"),
+            index("beds"),
+            index("since"),
+            index("owner"),
+            index("code", unique=True),
+            index("name", where={"suburb": "Leura"}),
+        ],
+    )
+    class Lodge:
+        name: str = field(default="")
+        suburb: str | None = field(default=None, stored_in="blob")
+        beds: int | None = field(default=None, stored_in="blob")
+        since: date | None = field(default=None, stored_in="blob")
+        owner: uuid.UUID | None = field(default=None, stored_in="blob")
+        code: str | None = field(default=None, stored_in="blob")
+
+    names = {
+        statement.split(" on ")[0].split(" if not exists ")[1]
+        for statement in schema.create_indexes(Lodge)
+    }
+    owner, since = uuid.uuid4(), date(2026, 3, 14)
+
+    with pool.store(records=[Lodge]) as store:
+        store.create(Lodge)
+        lodges = getattr(store, f"c_{RUN}_blob")
+        lodges.add_all(
+            [
+                Lodge(
+                    name=f"n{n}",
+                    suburb="Leura" if n % 100 == 0 else f"S{n % 300}",
+                    beds=n % 250,
+                    since=since if n % 150 == 0 else date(2026, 1, 1 + n % 28),
+                    owner=owner if n % 200 == 0 else uuid.uuid4(),
+                )
+                for n in range(1500)
+            ]
+        )
+        store.conn.execute(
+            f"insert into {table} (id, name, data) values"
+            " (gen_random_uuid(), 'odd', %s)",
+            [jsonb({"suburb": 7, "beds": "7"})],
+        )
+
+        # The builds were started by `create` and are nobody's to wait on by
+        # id, so this waits on what they are for: the last one declared
+        # refusing a duplicate.
+        lodges.add(Lodge(name="first", code="KAT"))
+        refused = None
+        for _ in range(60):
+            try:
+                taken = lodges.add(Lodge(name="second", code="KAT"))
+            except DuplicateRecord as error:
+                refused = error
+                break
+            # Taken, so the build is still running. Out it comes again, or the
+            # build finishes over a duplicate and fails.
+            taken.delete()
+            time.sleep(1)
+        if refused is None:
+            raise AssertionError("a unique index over a blob field never enforced")
+        if refused.columns != ("code",):
+            raise AssertionError(
+                f"the clash named {refused.columns}, not the field: {refused}"
+            )
+        drifted = schema.drift(store.conn, Lodge)
+        if drifted:
+            raise AssertionError(f"drift on a table just created: {drifted}")
+        store.conn.execute(f"analyze {table}")
+
+        questions = {
+            "a str": ({"suburb": "S7"}, f"{table}_suburb_"),
+            "an int": ({"beds": 7}, f"{table}_beds_"),
+            "a date": ({"since": since}, f"{table}_since_"),
+            "a uuid": ({"owner": owner}, f"{table}_owner_"),
+            "one of several": ({"suburb": dray.any_of("S7", "S8")}, f"{table}_suburb_"),
+            "a predicate": ({"suburb": "Leura", "name": "n100"}, f"{table}_name_"),
+            "text where a number is held": ({"suburb": "7"}, f"{table}_suburb_"),
+        }
+        def planned(sent: Any, through: str) -> str | None:
+            """The plan's first line where it does not go through the index.
+            Asked for a while rather than once: the other builds finish in
+            their own time, and so does the `analyze` above, which is a job
+            here rather than a statement that returns when it is done."""
+            for _ in range(60):
+                plan = "\n".join(
+                    row[0]
+                    for row in store.conn.execute(
+                        f"explain {sent.sql}", sent.params
+                    ).fetchall()
+                )
+                if through in plan:
+                    return None
+                time.sleep(1)
+            return plan.splitlines()[0].strip()
+
+        missed = []
+        for what, (question, through) in questions.items():
+            with store.watching() as seen:
+                found = lodges.find(equals=question)
+            (sent,) = [
+                span
+                for span in seen
+                if span.kind == "statement" and span.phase == "close"
+            ]
+            scanned = planned(sent, through)
+            if scanned:
+                missed.append(f"{what}: {scanned}")
+            # What the jsonb comparison gives by itself, which is the answer
+            # this must not have moved from.
+            alone, values = [], []
+            for name, value in question.items():
+                if name == "name":
+                    alone.append("name = %s")
+                    values.append(value)
+                elif isinstance(value, tuple):
+                    alone.append(f"data->'{name}' = any(%s)")
+                    values.append([jsonb(each) for each in value])
+                else:
+                    alone.append(f"data->'{name}' = %s")
+                    values.append(jsonb(value))
+            (wanted,) = store.conn.execute(
+                f"select count(*) from {table} where {' and '.join(alone)}", values
+            ).fetchone()
+            if len(found) != wanted:
+                raise AssertionError(
+                    f"{what}: {len(found)} found through the index and "
+                    f"{wanted} by the jsonb comparison alone"
+                )
+        if missed:
+            raise AssertionError(
+                "a find on an indexed blob field was not planned through its "
+                f"index — {'; '.join(missed)}"
+            )
+
+    return (
+        f"{len(names)} indexes over the document, {len(questions)} reads planned"
+        " through them with the answers unchanged, and a duplicate refused by"
+        " the field's name"
+    )
 
 
 @check("long-index-name")

@@ -172,6 +172,17 @@ def _clash(cls: type, record: Any, error: Any) -> "DuplicateRecord":
     # `Key (table_id, slot_at)=(4, 19:00) already exists.` — the names before
     # the `=` are worth having and the values after it are not. An expression
     # index puts brackets inside the brackets and matches nothing, deliberately.
+    # A field in the blob is one expression dray wrote itself, so it is read
+    # back as the field it is: `(data ->> 'code'::text)` is `code`. The
+    # column's name comes back quoted where it is a word the database
+    # reserves.
+    blob = re.escape(getattr(cls, "__dray_blob_column__", "data"))
+    detail = re.sub(
+        rf"\(\"?{blob}\"? ->> '([a-z_][a-z0-9_]*)'::text\)",
+        r"\1",
+        detail,
+        flags=re.I,
+    )
     found = re.match(r"Key \(([a-z_][a-z0-9_]*(?:, [a-z_][a-z0-9_]*)*)\)=", detail, re.I)
     columns = tuple(name.strip() for name in found.group(1).split(",")) if found else None
 

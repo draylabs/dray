@@ -36,6 +36,7 @@ from dray.model import (
     Sql,
     ValidationError,
     Write,
+    indexed_text,
     _NOT_YOURS,
     _checked_most,
     _checked_ttl,
@@ -1009,8 +1010,26 @@ class Collection:
             # The name is a declared field, so interpolating it is safe; the
             # value never is and always goes as a parameter.
             inside = name in self.cls.__dray_blob__
+            # A blob field some index is over is asked about twice: as text,
+            # which is the expression the index holds, and as jsonb, which is
+            # how every other blob field is asked about. The second is the
+            # answer and the first is only how to get to it — a row the jsonb
+            # comparison takes has that text, so the text half removes nothing
+            # the other would have kept, and what comes back does not depend
+            # on whether the class declared an index. Where a value has no
+            # text to rely on, the first half is left off and the read scans.
+            #
+            # One row is out of reach of that: a whole number held in the
+            # document as `7.0` equals 7 as jsonb and is not the text `7`. dray
+            # writes an `int` as `7`, so it takes a row written while the
+            # field was a `float`, or by something else.
+            reached = inside and name in self.cls.__dray_blob_indexed__
             if isinstance(value, AnyOf):
                 if inside:
+                    texts = [indexed_text(each) for each in value]
+                    if reached and None not in texts:
+                        where.append(f"{self.blob}->>'{name}' = any(%s)")
+                        params.append(texts)
                     where.append(f"{self.blob}->'{name}' = any(%s)")
                     params.append([jsonb(each) for each in value])
                 else:
@@ -1030,6 +1049,10 @@ class Collection:
                 column = f"{self.blob}->>'{name}'" if inside else name
                 where.append(f"{column} is null")
             elif inside:
+                text = indexed_text(value) if reached else None
+                if text is not None:
+                    where.append(f"{self.blob}->>'{name}' = %s")
+                    params.append(text)
                 where.append(f"{self.blob}->'{name}' = %s")
                 params.append(jsonb(value))
             else:

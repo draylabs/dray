@@ -7568,16 +7568,384 @@ def test_a_unique_index_may_not_say_where_its_nulls_go():
             due_on: date | None = field(default=None)
 
 
-def test_a_blob_field_cannot_be_indexed():
-    """There is no column to index, and on DSQL `jsonb` carries no index support
-    at all — which is what makes promoting a field the only way to make it fast
-    rather than merely the tidier one."""
+def test_a_blob_field_is_indexed_over_its_text():
+    """Nothing is moved to get it: no column, no row rewritten. The index is
+    over the value read out of the document as text, and the name is marked
+    because the field's own name does not say that — which is what lets the
+    field be given a column later and ask for a different index."""
 
-    with pytest.raises(TypeError, match="no column to index"):
+    @record(table="lodge", collection="lodges", indexes=[index("suburb")])
+    class Lodge:
+        suburb: str | None = field(default=None, stored_in="blob")
 
-        @record(table="lodge", collection="lodges", indexes=[index("suburb")])
+    assert schema.create_indexes(Lodge) == [
+        "create index async if not exists lodge_suburb_0e6019"
+        " on lodge ((data->>'suburb'))"
+    ]
+
+    @record(table="lodge", collection="lodges", indexes=[index("suburb")])
+    class Promoted:
+        suburb: str | None = field(default=None)
+
+    assert schema.create_indexes(Promoted) == [
+        "create index async if not exists lodge_suburb on lodge (suburb)"
+    ]
+
+
+def test_a_find_on_an_indexed_blob_field_asks_twice_and_answers_the_same(store):
+    """The text half is the expression the index holds and the jsonb half is
+    the comparison `find` makes on any blob field. A row passing the second
+    has the text the first asks for, so the first only narrows — and the rows that would
+    tell the two apart are here: a number under a text field, text under a
+    number field. Asked of a class with the index and one without, over one
+    table, the answers are the same list."""
+
+    def declare(indexes):
+        @record(table="lodge", collection="lodges", indexes=indexes)
         class Lodge:
+            name: str = field(default="")
             suburb: str | None = field(default=None, stored_in="blob")
+            beds: int | None = field(default=None, stored_in="blob")
+            open: bool | None = field(default=None, stored_in="blob")
+            since: date | None = field(default=None, stored_in="blob")
+            owner: UUID | None = field(default=None, stored_in="blob")
+
+        return Lodge
+
+    owner, since = uuid4(), date(2026, 3, 14)
+    Indexed = declare([index("suburb"), index("beds"), index("open"),
+                       index("since"), index("owner")])
+    store.create(Indexed)
+    store.lodges.add_all([
+        Indexed(name="a", suburb="Leura", beds=7, open=True, since=since,
+                owner=owner),
+        Indexed(name="b", suburb="Katoomba", beds=4, open=False),
+        Indexed(name="c"),
+    ])
+    # Written past dray, the way a row from an older shape of the class is.
+    store.conn.execute(
+        "insert into lodge (id, name, data) values"
+        " (gen_random_uuid(), 'd', '{\"suburb\": 7, \"beds\": \"7\"}')"
+    )
+
+    with store.watching() as seen:
+        store.lodges.find(equals={"suburb": "Leura"})
+    (sent,) = [span.sql for span in seen if span.kind == "statement"
+               and span.phase == "close"]
+    assert "data->>'suburb' = %s and data->'suburb' = %s" in sent
+
+    Plain = declare(None)
+    plainly = Store(store.conn)
+    plainly.serves(Plain)
+    with plainly.watching() as seen:
+        plainly.lodges.find(equals={"suburb": "Leura"})
+    (sent,) = [span.sql for span in seen if span.kind == "statement"
+               and span.phase == "close"]
+    assert "->>" not in sent
+
+    questions = [
+        {"suburb": "Leura"}, {"suburb": "7"}, {"beds": 7}, {"beds": 4},
+        {"open": True}, {"open": False}, {"since": since}, {"owner": owner},
+        {"suburb": None}, {"suburb": any_of("Leura", "Katoomba")},
+        {"suburb": none_of("Leura")}, {"suburb": "Leura", "beds": 7},
+    ]
+    for question in questions:
+        with_index = sorted(r.name for r in store.lodges.find(equals=question))
+        without = sorted(r.name for r in plainly.lodges.find(equals=question))
+        assert with_index == without, question
+
+    assert [r.name for r in store.lodges.find(equals={"suburb": "Leura"})] == ["a"]
+    assert [r.name for r in store.lodges.find(equals={"suburb": "7"})] == []
+
+
+def test_a_blob_field_nothing_indexes_is_asked_about_one_way(store):
+    """The second comparison is there to reach an index. Where there is none
+    it is a condition that costs something and buys nothing, so a field no
+    index mentions is sent the one way."""
+
+    @record(table="lodge", collection="lodges")
+    class Lodge:
+        suburb: str | None = field(default=None, stored_in="blob")
+
+    store.create(Lodge)
+    with store.watching() as seen:
+        store.lodges.find(equals={"suburb": "Leura"})
+    (sent,) = [span.sql for span in seen if span.kind == "statement"
+               and span.phase == "close"]
+    assert "->>" not in sent
+
+
+def test_only_a_value_with_one_text_is_indexed_in_the_blob():
+    """The index is over text, so it serves a kind of value whose text says
+    which value it is. `4.5` and `4.50` are one `Decimal` and two strings, and
+    a `datetime` is one moment in as many spellings as there are time zones —
+    an index over either would be found by some spellings of a value and not
+    by others."""
+
+    for annotation in (Decimal, datetime, float, dict, list, bytes):
+        with pytest.raises(ValueError, match="is over its text"):
+
+            @record(table="lodge", collection="lodges",
+                    indexes=[index("thing")])
+            class Lodge:
+                thing: annotation | None = field(default=None,
+                                                 stored_in="blob")
+
+
+def test_a_unique_index_over_a_blob_field_is_a_statement_of_its_own(store):
+    """A constraint in a `create table` takes columns and no expression, so
+    this kind is never one. It still refuses a duplicate, says which field, and
+    lets through any number of rows that do not carry the key at all."""
+
+    @record(table="lodge", collection="lodges",
+            indexes=[index("code", unique=True)])
+    class Lodge:
+        name: str = field(default="")
+        code: str | None = field(default=None, stored_in="blob")
+
+    table, *after = schema.statements(Lodge)
+    assert "constraint" not in table
+    assert after == [
+        "create unique index async if not exists lodge_code_"
+        + after[0].split("lodge_code_")[1][:6]
+        + " on lodge ((data->>'code'))"
+    ]
+
+    store.create(Lodge)
+    assert schema.drift(store.conn, Lodge) == []
+    store.lodges.add(Lodge(name="a", code="KAT"))
+    with pytest.raises(DuplicateRecord) as refused:
+        store.lodges.add(Lodge(name="b", code="KAT"))
+    assert refused.value.columns == ("code",)
+    store.lodges.add(Lodge(name="c"))
+    store.lodges.add(Lodge(name="d"))
+
+
+def test_an_index_can_cover_the_rows_a_blob_field_says(store):
+    """The predicate compares the field the way an index over it would, as
+    text, and a filter naming it is sent that comparison — so the read that
+    was meant to reach this index is one the database can see implies it."""
+
+    @record(table="person", collection="people",
+            indexes=[index("family_name", where={"suburb": "Leura"}),
+                     index("family_name", where={"visits": 7}),
+                     index("family_name", where={"suburb": None})])
+    class Person:
+        family_name: str = field(default="")
+        suburb: str | None = field(default=None, stored_in="blob")
+        visits: int | None = field(default=None, stored_in="blob")
+
+    first, second, third = schema.create_indexes(Person)
+    assert first == (
+        "create index async if not exists person_family_name_4328b9"
+        " on person (family_name) where data->>'suburb' = 'Leura'"
+    )
+    assert second.endswith("where data->>'visits' = '7'")
+    assert third.endswith("where data->>'suburb' is null")
+
+    store.create(Person)
+    assert schema.drift(store.conn, Person) == []
+    store.people.add(Person(family_name="Stein", suburb="Leura", visits=7))
+    with store.watching() as seen:
+        found = store.people.find(
+            equals={"suburb": "Leura", "family_name": "Stein"}
+        )
+    assert len(found) == 1
+    (sent,) = [span.sql for span in seen if span.kind == "statement"
+               and span.phase == "close"]
+    assert "data->>'suburb' = %s" in sent
+
+
+def test_the_refusal_of_a_blob_index_sends_somebody_where_it_would_work():
+    """Give it a column is the answer for a `Decimal`, which a column indexes.
+    For `bytes` it is advice that walks into the next refusal, since that
+    column is one DSQL will not index either."""
+
+    def declare(annotation):
+        @record(table="lodge", collection="lodges", indexes=[index("thing")])
+        class Lodge:
+            thing: annotation | None = field(default=None, stored_in="blob")
+
+    with pytest.raises(ValueError, match="Give the field a column"):
+        declare(Decimal)
+
+    with pytest.raises(ValueError, match="will not index either"):
+        declare(bytes)
+
+
+def test_a_whole_number_held_as_a_float_is_the_row_the_index_passes_by(store):
+    """The one place the two halves disagree, pinned so that it is a known
+    edge rather than a surprise. A field that was a `float` wrote `7.0`; as an
+    `int` with an index over it, 7 is the text `7` and that row's is `7.0`.
+    Without the index the jsonb comparison alone finds both."""
+
+    def declare(annotation, indexes):
+        @record(table="lodge", collection="lodges", indexes=indexes)
+        class Lodge:
+            name: str = field(default="")
+            beds: annotation | None = field(default=None, stored_in="blob")
+
+        return Lodge
+
+    Before = declare(float, None)
+    store.create(Before)
+    store.lodges.add(Before(name="a", beds=7.0))
+
+    Plain = declare(int, None)
+    plainly = Store(store.conn)
+    plainly.serves(Plain)
+    plainly.lodges.add(Plain(name="b", beds=7))
+    assert sorted(r.name for r in plainly.lodges.find(equals={"beds": 7})) == [
+        "a", "b",
+    ]
+
+    Indexed = declare(int, [index("beds")])
+    indexed = Store(store.conn)
+    indexed.serves(Indexed)
+    assert [r.name for r in indexed.lodges.find(equals={"beds": 7})] == ["b"]
+
+
+def test_a_value_with_no_text_to_rely_on_is_asked_about_one_way(store):
+    """A member of a `str` enum is a `str` the document holds by its value and
+    `str()` gives by its name. Sent as text it would ask the index for a word
+    no row has, so the text half is left off and the jsonb comparison answers
+    alone — for the value by itself and for a set with one such in it."""
+
+    class Suburb(str, Enum):
+        LEURA = "Leura"
+
+    @record(table="lodge", collection="lodges", indexes=[index("suburb")])
+    class Lodge:
+        name: str = field(default="")
+        suburb: str | None = field(default=None, stored_in="blob")
+
+    store.create(Lodge)
+    store.lodges.add(Lodge(name="a", suburb="Leura"))
+
+    def sent(question):
+        with store.watching() as seen:
+            found = store.lodges.find(equals=question)
+        (statement,) = [span.sql for span in seen if span.kind == "statement"
+                        and span.phase == "close"]
+        return statement, [r.name for r in found]
+
+    statement, found = sent({"suburb": Suburb.LEURA})
+    assert "->>" not in statement and found == ["a"]
+
+    statement, found = sent({"suburb": any_of("Katoomba", Suburb.LEURA)})
+    assert "->>" not in statement and found == ["a"]
+
+    statement, found = sent({"suburb": any_of("Katoomba", "Leura")})
+    assert "data->>'suburb' = any(%s) and data->'suburb' = any(%s)" in statement
+    assert found == ["a"]
+
+
+def test_a_predicate_may_want_any_blob_field_absent():
+    """`is null` is true or false of any kind of value and has no text to get
+    right, so the five kinds are a rule about a value being compared and not
+    about a field being named."""
+
+    @record(table="lodge", collection="lodges",
+            indexes=[index("name", where={"photo": None})])
+    class Lodge:
+        name: str = field(default="")
+        photo: bytes | None = field(default=None, stored_in="blob")
+
+    (statement,) = schema.create_indexes(Lodge)
+    assert statement.endswith("where data->>'photo' is null")
+
+
+def test_a_unique_blob_index_is_unique_over_text(store):
+    """Which is the same thing for every row the class wrote, and not for one
+    it did not: text `"8"` under an `int` field refuses an 8 that `find` cannot
+    then show to be there."""
+
+    @record(table="depot", collection="depots",
+            indexes=[index("code", unique=True)])
+    class Depot:
+        code: int | None = field(default=None, stored_in="blob")
+
+    store.create(Depot)
+    store.conn.execute(
+        "insert into depot (id, data) values"
+        " (gen_random_uuid(), '{\"code\": \"8\"}')"
+    )
+    with pytest.raises(DuplicateRecord):
+        store.depots.add(Depot(code=8))
+    assert store.depots.find(equals={"code": 8}) == []
+
+
+def test_a_clash_on_a_blob_field_is_named_whatever_the_document_is_called(store):
+    """The field's name is read back out of a sentence the database writes,
+    and the database quotes the document's column where its name is a word it
+    reserves — and puts it beside the columns where the index has both."""
+
+    @record(table="depot", collection="depots", blob="row",
+            indexes=[index("region", "code", unique=True)])
+    class Depot:
+        region: str = field(default="")
+        code: str | None = field(default=None, stored_in="blob")
+
+    assert schema.create_indexes(Depot)[0].endswith(
+        "on depot (region, (row->>'code'))"
+    )
+
+    store.create(Depot)
+    store.depots.add(Depot(region="north", code="K"))
+    with pytest.raises(DuplicateRecord) as refused:
+        store.depots.add(Depot(region="north", code="K"))
+    assert refused.value.columns == ("region", "code")
+
+
+def test_a_child_indexes_a_field_in_its_own_document(store):
+    """A child's table has a document of its own, and an index over a field in
+    it is written against that one and reached through the parent."""
+
+    @record(table="walker", collection="walkers")
+    class Walker:
+        family_name: str = field(default="")
+
+    @child(of=Walker, name="legs", table="leg", indexes=[index("grade")])
+    class Leg:
+        grade: str | None = field(default=None, stored_in="blob")
+
+    made = schema.create_indexes(Leg)
+    assert any("on leg ((data->>'grade'))" in statement for statement in made)
+
+    store.create(Walker, Leg)
+    walker = store.walkers.add(Walker(family_name="Stein"))
+    walker.legs.add(Leg(grade="hard"))
+    walker.legs.add(Leg(grade="easy"))
+    walker.save()
+    assert [leg.grade for leg in walker.legs.find(equals={"grade": "hard"})] == [
+        "hard"
+    ]
+
+
+def test_a_unique_blob_index_may_say_where_its_nulls_go():
+    """Never a constraint in the `create table`, so the reason a unique index
+    is refused a placement does not reach it."""
+
+    @record(table="depot", collection="depots",
+            indexes=[index(asc("code", nulls="first"), unique=True)])
+    class Depot:
+        code: str | None = field(default=None, stored_in="blob")
+
+    (statement,) = schema.create_indexes(Depot)
+    assert statement.endswith("on depot ((data->>'code') nulls first)")
+
+
+def test_a_composite_index_may_mix_a_column_and_a_blob_field():
+    """One key list, each key written the way its field is stored."""
+
+    @record(table="person", collection="people",
+            indexes=[index("status", asc("suburb", nulls="first"))])
+    class Person:
+        status: str = field(default="")
+        suburb: str | None = field(default=None, stored_in="blob")
+
+    (statement,) = schema.create_indexes(Person)
+    assert statement.endswith("on person (status, (data->>'suburb') nulls first)")
 
 
 def test_an_index_on_a_field_the_class_does_not_have_is_refused():
@@ -8157,9 +8525,6 @@ def test_a_predicate_dray_cannot_hold_to_the_class_is_refused():
 
     with pytest.raises(ValueError, match="is not one of enquiry, volunteer"):
         declare({"status": "voluntear"})
-
-    with pytest.raises(TypeError, match="stored in the blob"):
-        declare({"suburb": "Leura"})
 
     with pytest.raises(TypeError, match="one of several values is Sql"):
         declare({"status": any_of("enquiry", "volunteer")})

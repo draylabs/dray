@@ -14,7 +14,7 @@ from decimal import Decimal
 from uuid import UUID
 from typing import Any
 
-from dray.model import Index, Sql, _nulls, base_type
+from dray.model import Index, Sql, _nulls, base_type, indexed_text
 from dray.store import cursor
 
 # What a `numeric` column is when the field says nothing: DSQL's own default,
@@ -137,7 +137,23 @@ def _literal(value: Any) -> str:
     return f"'{text}'"
 
 
-def _predicate(declared: Index) -> str | None:
+def _key(cls: type, name: Any) -> str:
+    """
+    One key of an index as its statement writes it: the column, or for a field
+    in the blob its value read out of the document as text.
+
+    As text and never cast to what the field declares. A cast is the better
+    index for as long as every row holds what the class says, and the blob is
+    where nothing makes that so — one row with something else under the key
+    fails the build, and then every read that goes through it. `->>` fails on
+    nothing, and `model.BLOB_INDEXABLE` is the fields it is good enough for.
+    """
+    if str(name) not in cls.__dray_blob__:
+        return f"{name}{_nulls(name)}"
+    return f"({cls.__dray_blob_column__}->>'{name}'){_nulls(name)}"
+
+
+def _predicate(cls: type, declared: Index) -> str | None:
     """
     Which rows an index covers, as the `where` of its statement — or `None` for
     one that covers them all.
@@ -153,10 +169,19 @@ def _predicate(declared: Index) -> str | None:
         return None
     if isinstance(where, Sql):
         return where.strip()
-    return " and ".join(
-        f"{name} is null" if value is None else f"{name} = {_literal(value)}"
-        for name, value in where
-    )
+    terms = []
+    for name, value in where:
+        inside = name in cls.__dray_blob__
+        reads = f"{cls.__dray_blob_column__}->>'{name}'" if inside else name
+        if value is None:
+            terms.append(f"{reads} is null")
+        else:
+            # Text against text for a field in the blob, whatever it holds:
+            # `->>` hands a number back as a string, and `= 7` would compare
+            # that with an integer.
+            against = indexed_text(value) if inside else value
+            terms.append(f"{reads} = {_literal(against)}")
+    return " and ".join(terms)
 
 
 def _index_name(cls: type, declared: Index) -> str:
@@ -179,7 +204,15 @@ def _index_name(cls: type, declared: Index) -> str:
     starts returning is the string those tables were already carrying.
     """
     named = "_".join((cls.__dray_table__, *declared.columns))
-    covers = _predicate(declared)
+    covers = _predicate(cls, declared)
+    over = [_key(cls, name) for name in declared.columns]
+    # An index over the blob is marked the same way and for the same reason:
+    # the field's name does not say the index is over the document. It matters
+    # on the day the field is given a column — the class then asks for the
+    # unmarked name, which no index has, where otherwise it would find this
+    # one under it and build nothing over the column.
+    if any(str(name) in cls.__dray_blob__ for name in declared.columns):
+        covers = f"({', '.join(over)})" + (f" where {covers}" if covers else "")
     if covers is None:
         return _shortened(named)
     # The columns no longer say which index this is, since the same ones over
@@ -215,8 +248,10 @@ def create_table(cls: type) -> str:
 
     An index declared `unique=True` over every row is a constraint here rather
     than a statement of its own, which is dray deciding where the DDL goes
-    rather than the caller. One with a `where=` is not here at all, since a
-    constraint has no way to say it. A constraint brings its own backing index, built with the table and
+    rather than the caller. One with a `where=`, or over a field in the blob,
+    is not here at all, since a constraint has no way to say either.
+
+    A constraint brings its own backing index, built with the table and
     enforcing the moment the table exists — where `create unique index async` is
     a background job that lets a duplicate through until it finishes.
     """
@@ -227,7 +262,7 @@ def create_table(cls: type) -> str:
         f"    constraint {_index_name(cls, declared)}"
         f" unique ({', '.join(declared.columns)})"
         for declared in cls.__dray_indexes__
-        if _is_constraint(declared)
+        if _is_constraint(cls, declared)
     ]
     key = cls.__dray_key__
     lines = [
@@ -241,11 +276,16 @@ def create_table(cls: type) -> str:
     return f"create table if not exists {cls.__dray_table__} (\n{body}\n)"
 
 
-def _is_constraint(declared: Index) -> bool:
-    """Whether an index is one a `create table` can hold: unique, and over
-    every row. A constraint has no `where`, so a unique index over some of the
-    rows is a statement of its own whichever table it is for."""
-    return declared.unique and declared.where is None
+def _is_constraint(cls: type, declared: Index) -> bool:
+    """Whether an index is one a `create table` can hold: unique, over every
+    row, and over columns. A constraint has no `where` and takes no
+    expression, so a unique index over some of the rows or over a field in the
+    blob is a statement of its own whichever table it is for."""
+    return (
+        declared.unique
+        and declared.where is None
+        and not any(str(name) in cls.__dray_blob__ for name in declared.columns)
+    )
 
 
 def _leads_with_the_parent(cls: type) -> bool:
@@ -294,11 +334,11 @@ def _index_statements(cls: type, asynchronous: bool) -> list[tuple[bool, str]]:
         # else. A direction is refused on the class, and the unique kind is
         # refused a placement — so what is written here is always a shape both
         # this statement and the constraint in `create_table` can hold.
-        over = ", ".join(f"{name}{_nulls(name)}" for name in declared.columns)
-        covers = _predicate(declared)
+        over = ", ".join(_key(cls, name) for name in declared.columns)
+        covers = _predicate(cls, declared)
         made.append(
             (
-                _is_constraint(declared),
+                _is_constraint(cls, declared),
                 f"{kind} if not exists {_index_name(cls, declared)}"
                 f" on {table} ({over})"
                 + (f" where {covers}" if covers else ""),
@@ -313,8 +353,8 @@ def create_indexes(cls: type, *, asynchronous: bool = True) -> list[str]:
 
     These are the statements for a table that is already there — a migration
     adding an index to a live table. `statements` is the other half, for a table
-    being created, and a unique index over every row appears there as a
-    constraint in the `create table` instead of here.
+    being created, and a unique index over every row and over columns
+    appears there as a constraint in the `create table` instead of here.
 
     Every read of a child is "the children of this parent", so an index on
     `(parent_type, parent_id)` is on every child table that has not asked for
@@ -357,9 +397,9 @@ def statements(cls: type, *, asynchronous: bool = True) -> list[str]:
     after it, so it is enforcing from the moment the table is there. It is the
     same declaration `create_indexes` writes as `create unique index async`,
     said the way that is valid for a table nobody has written to yet. One with
-    a `where=` is the exception, since a constraint cannot carry one: it is
-    among the statements after, and on a cluster it enforces once its build
-    has finished."""
+    a `where=`, or over a field in the blob, is the exception, since a
+    constraint can carry neither: it is among the statements after, and on a
+    cluster it enforces once its build has finished."""
     return [
         create_table(cls),
         *(
