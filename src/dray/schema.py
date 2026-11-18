@@ -7,13 +7,14 @@ have drifted apart — which is the failure a hand-written schema cannot see,
 because a missing column looks exactly like a field nobody has set yet.
 """
 
+import hashlib
 from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from uuid import UUID
 from typing import Any
 
-from dray.model import Index, _nulls, base_type
+from dray.model import Index, Sql, _nulls, base_type
 from dray.store import cursor
 
 # What a `numeric` column is when the field says nothing: DSQL's own default,
@@ -92,10 +93,11 @@ def _columns(cls: type) -> list[tuple[str, str]]:
 NAME_LIMIT = 63
 
 
-def _shortened(name: str) -> str:
+def _shortened(name: str, limit: int = NAME_LIMIT) -> str:
     """An identifier as the database will hold it: itself, or its first 63
-    bytes where it is longer than that."""
-    if len(name.encode()) <= NAME_LIMIT:
+    bytes where it is longer than that. `limit` is for a name that has
+    something still to go on the end of it."""
+    if len(name.encode()) <= limit:
         return name
     # On a character boundary rather than at a byte. `name[:63]` agrees with the
     # database for as long as every identifier is ASCII and disagrees the moment
@@ -103,13 +105,66 @@ def _shortened(name: str) -> str:
     # this same bug arriving by another road. Everything before the cut is valid
     # UTF-8 by construction, so `errors="ignore"` drops the partial sequence at
     # the end and nothing else.
-    return name.encode()[:NAME_LIMIT].decode(errors="ignore")
+    return name.encode()[:limit].decode(errors="ignore")
+
+
+def _literal(value: Any) -> str:
+    """
+    One value of a predicate as the text a statement holds, since a `create
+    index` has nowhere to pass a parameter.
+
+    Written here rather than asked of psycopg, which would quote it as well and
+    no worse. The text is what an index is named from, so how a date or a
+    quote mark is spelled has to be the same for as long as there are tables
+    carrying that name — and a spelling that belonged to a driver would be one
+    a driver's release could move.
+
+    `model.PREDICATE_VALUES` is the list this answers for and a class is held
+    to it before it gets here. `bool` before `int`, which it is a kind of.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, Decimal):
+        # By its value and not by how it was typed. `1.5` and `1.50` are the
+        # same rows, and `str` would make them two names for one index.
+        return format(value.normalize(), "f")
+    if isinstance(value, int):
+        return str(value)
+    # A quote doubled, which is the whole of quoting while a backslash means
+    # nothing — and it means nothing on DSQL and on any PostgreSQL left at its
+    # default, `standard_conforming_strings`.
+    text = str(value).replace("'", "''")
+    return f"'{text}'"
+
+
+def _predicate(declared: Index) -> str | None:
+    """
+    Which rows an index covers, as the `where` of its statement — or `None` for
+    one that covers them all.
+
+    `Sql` goes through as it was written, spacing and all. Tidying it here
+    would mean knowing which spaces are inside a quoted value and which line
+    ends a comment, and that is the database's reading to do. A mapping is one
+    equality per field, in name order, which `model._covered` has already put
+    them in.
+    """
+    where = declared.where
+    if where is None:
+        return None
+    if isinstance(where, Sql):
+        return where.strip()
+    return " and ".join(
+        f"{name} is null" if value is None else f"{name} = {_literal(value)}"
+        for name, value in where
+    )
 
 
 def _index_name(cls: type, declared: Index) -> str:
     """
     What dray calls an index it asked for: the table, then the columns it
-    covers, joined with underscores, cut to what an identifier can hold.
+    covers, joined with underscores, cut to what an identifier can hold — and
+    for one covering only some of the rows, six characters after that which
+    say which.
 
     `drift` matches an index by this name and by nothing else, which makes the
     name a promise rather than a detail — change how it is built and every table
@@ -123,7 +178,27 @@ def _index_name(cls: type, declared: Index) -> str:
     for ever. Cutting the way the database cuts renames nothing: the string this
     starts returning is the string those tables were already carrying.
     """
-    return _shortened("_".join((cls.__dray_table__, *declared.columns)))
+    named = "_".join((cls.__dray_table__, *declared.columns))
+    covers = _predicate(declared)
+    if covers is None:
+        return _shortened(named)
+    # The columns no longer say which index this is, since the same ones over
+    # other rows are another index. So the predicate is in the name, as six
+    # characters of a digest of it: short enough to leave the columns
+    # readable, and worked out rather than chosen so that a predicate cannot
+    # be edited under a name that stays put. The objection to a digest above
+    # is about names tables already carry, and no table carries one of these.
+    #
+    # Of the predicate with its spacing closed up, which is the one place that
+    # is done. A statement reflowed onto two lines is the same index and has to
+    # keep its name; the cost is that two differing only by spaces inside a
+    # quoted value share one, and are refused where the class is written like
+    # any other pair that do.
+    #
+    # Cut before it goes on rather than after, or two long names differing
+    # only in their predicates would be cut back into one.
+    mark = hashlib.sha256(" ".join(covers.split()).encode()).hexdigest()[:6]
+    return f"{_shortened(named, NAME_LIMIT - 7)}_{mark}"
 
 
 def create_table(cls: type) -> str:
@@ -138,9 +213,10 @@ def create_table(cls: type) -> str:
     fields. It is what makes adding an attribute a write rather than a
     migration, and a table that lacks it would need one on the day you want it.
 
-    An index declared `unique=True` is a constraint here rather than a statement
-    of its own, which is dray deciding where the DDL goes rather than the
-    caller. A constraint brings its own backing index, built with the table and
+    An index declared `unique=True` over every row is a constraint here rather
+    than a statement of its own, which is dray deciding where the DDL goes
+    rather than the caller. One with a `where=` is not here at all, since a
+    constraint has no way to say it. A constraint brings its own backing index, built with the table and
     enforcing the moment the table exists — where `create unique index async` is
     a background job that lets a duplicate through until it finishes.
     """
@@ -151,7 +227,7 @@ def create_table(cls: type) -> str:
         f"    constraint {_index_name(cls, declared)}"
         f" unique ({', '.join(declared.columns)})"
         for declared in cls.__dray_indexes__
-        if declared.unique
+        if _is_constraint(declared)
     ]
     key = cls.__dray_key__
     lines = [
@@ -163,6 +239,13 @@ def create_table(cls: type) -> str:
     )
     body = ",\n".join(lines + constraints)
     return f"create table if not exists {cls.__dray_table__} (\n{body}\n)"
+
+
+def _is_constraint(declared: Index) -> bool:
+    """Whether an index is one a `create table` can hold: unique, and over
+    every row. A constraint has no `where`, so a unique index over some of the
+    rows is a statement of its own whichever table it is for."""
+    return declared.unique and declared.where is None
 
 
 def _leads_with_the_parent(cls: type) -> bool:
@@ -178,13 +261,19 @@ def _leads_with_the_parent(cls: type) -> bool:
     leading run like any other.
     """
     pair = (cls.__dray_parent_type__, cls.__dray_parent_id__)
-    return any(one.columns[:2] == pair for one in cls.__dray_indexes__)
+    # Over every row, or it serves the reads through a parent for some of a
+    # parent's children and leaves the rest — and the delete that takes them
+    # all — to a scan.
+    return any(
+        one.columns[:2] == pair and one.where is None
+        for one in cls.__dray_indexes__
+    )
 
 
 def _index_statements(cls: type, asynchronous: bool) -> list[tuple[bool, str]]:
-    """Every index dray asks for, each paired with whether it is the unique
-    kind — which is what decides whether `statements` writes it out here or
-    leaves it to the constraint in the `create table`."""
+    """Every index dray asks for, each paired with whether it is one the
+    `create table` holds as a constraint — which is what decides whether
+    `statements` writes it out here or leaves it there."""
     table = cls.__dray_table__
     plain = "create index async" if asynchronous else "create index"
     unique = "create unique index async" if asynchronous else "create unique index"
@@ -206,11 +295,13 @@ def _index_statements(cls: type, asynchronous: bool) -> list[tuple[bool, str]]:
         # refused a placement — so what is written here is always a shape both
         # this statement and the constraint in `create_table` can hold.
         over = ", ".join(f"{name}{_nulls(name)}" for name in declared.columns)
+        covers = _predicate(declared)
         made.append(
             (
-                declared.unique,
+                _is_constraint(declared),
                 f"{kind} if not exists {_index_name(cls, declared)}"
-                f" on {table} ({over})",
+                f" on {table} ({over})"
+                + (f" where {covers}" if covers else ""),
             )
         )
     return made
@@ -222,8 +313,8 @@ def create_indexes(cls: type, *, asynchronous: bool = True) -> list[str]:
 
     These are the statements for a table that is already there — a migration
     adding an index to a live table. `statements` is the other half, for a table
-    being created, and a unique index appears there as a constraint in the
-    `create table` instead of here.
+    being created, and a unique index over every row appears there as a
+    constraint in the `create table` instead of here.
 
     Every read of a child is "the children of this parent", so an index on
     `(parent_type, parent_id)` is on every child table that has not asked for
@@ -265,13 +356,16 @@ def statements(cls: type, *, asynchronous: bool = True) -> list[str]:
     A unique index is in the `create table` rather than among the statements
     after it, so it is enforcing from the moment the table is there. It is the
     same declaration `create_indexes` writes as `create unique index async`,
-    said the way that is valid for a table nobody has written to yet."""
+    said the way that is valid for a table nobody has written to yet. One with
+    a `where=` is the exception, since a constraint cannot carry one: it is
+    among the statements after, and on a cluster it enforces once its build
+    has finished."""
     return [
         create_table(cls),
         *(
             statement
-            for unique, statement in _index_statements(cls, asynchronous)
-            if not unique
+            for constraint, statement in _index_statements(cls, asynchronous)
+            if not constraint
         ),
     ]
 

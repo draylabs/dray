@@ -172,7 +172,7 @@ DECORATORS = [
     ("field()", "what a field will take and what fills it",
      "default= default_factory= stored_in= choices= converter= "
      "validator= on_add= on_save= on_change= derived= precision= scale="),
-    ("index()", "what the table is indexed for", "*columns unique="),
+    ("index()", "what the table is indexed for", "*columns unique= where="),
 ]
 
 MARKERS = [

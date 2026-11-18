@@ -1017,6 +1017,15 @@ def _index_shapes(pool: Pool, table: str) -> str:
     theoretical one, and the argument for a rule a record cannot be without
     going in the `create table` instead.
 
+    A predicate is taken, and two things about one are asked here because the
+    page says both and neither is in what AWS write down. That it is used for a
+    read whose value arrives as a parameter, which is every read dray sends — a
+    planner proving `status = $1` implies `status = 'volunteer'` has to look at
+    the value, and one that planned before binding would leave the index
+    unused by everything but SQL with the literal typed into it. And that a
+    unique one constrains only the rows its predicate holds, which is the
+    whole of what it is for.
+
     The last two are here because a name search is the shape everybody reaches
     for and the local answer to it does not exist here. A plain btree cannot
     serve `like 'rob%'` in any collation but `C`, so on PostgreSQL you reach for
@@ -1048,6 +1057,10 @@ def _index_shapes(pool: Pool, table: str) -> str:
         "a sort order": f"create index async {table}_desc on {table} (n desc)",
         "nulls first": f"create index async {table}_nf on {table} (n nulls first)",
         "nulls last": f"create index async {table}_nl on {table} (n nulls last)",
+        "unique, a placement and a predicate": (
+            f"create unique index async {table}_unp on {table}"
+            " (e, n nulls first) where flag"
+        ),
         "no async": f"create index {table}_sync on {table} (a)",
         "unique, no async": f"create unique index {table}_usync on {table} (e, f)",
         "unique as a constraint": (
@@ -1068,7 +1081,6 @@ def _index_shapes(pool: Pool, table: str) -> str:
         "eight key columns": f"create index async {table}_eight on {table} ({eight})",
     }
     door_shut = {
-        "a predicate",
         "a sort order",
         "no async",
         "unique, no async",
@@ -1142,6 +1154,58 @@ def _index_shapes(pool: Pool, table: str) -> str:
         # The pair rather than either column, which is what it is for.
         store.conn.execute(held, ["r"])
 
+        # A predicate, on a unique index so that both halves are one build:
+        # what it constrains and whether a read reaches it.
+        job = submitted(
+            store.conn,
+            f"create unique index async {table}_open on {table} (b)"
+            " where a = 'open'",
+        )
+        store.conn.execute("call sys.wait_for_job(%s)", [job])
+        one = f"insert into {table} (id, b, a) values (gen_random_uuid(), 'k', %s)"
+        store.conn.execute(one, ["open"])
+        try:
+            store.conn.execute(one, ["open"])
+        except psycopg.errors.UniqueViolation:
+            pass
+        else:
+            raise AssertionError(
+                "a unique index with a predicate took a duplicate among the "
+                "rows the predicate holds"
+            )
+        # Outside the predicate nothing is constrained, a thousand times
+        # over — and that many because the reads below are asked of a planner,
+        # which on a table of four rows scans it whatever indexes there are.
+        store.conn.execute(
+            f"insert into {table} (id, b, a)"
+            " select gen_random_uuid(), 'k', 'shut' from generate_series(1, 1000)"
+        )
+        store.conn.execute(f"analyze {table}")
+        reads = {
+            "implied by a parameter": (
+                f"select id from {table} where a = %s and b = %s",
+                ["open", "k"],
+                True,
+            ),
+            "not implied": (
+                f"select id from {table} where a = %s and b = %s",
+                ["shut", "k"],
+                False,
+            ),
+        }
+        for what, (statement, values, wanted) in reads.items():
+            plan = "\n".join(
+                row[0]
+                for row in store.conn.execute(
+                    f"explain {statement}", values
+                ).fetchall()
+            )
+            if (f"{table}_open" in plan) is not wanted:
+                raise AssertionError(
+                    f"a read {what} by the predicate "
+                    f"{'missed' if wanted else 'used'} the index:\n{plan}"
+                )
+
         # Last, because it fills the table's budget up. The number is
         # documented; that the primary key is one of the 24 is not, and this is
         # the only way to ask.
@@ -1169,7 +1233,8 @@ def _index_shapes(pool: Pool, table: str) -> str:
         f"refused {', '.join(sorted(refused))};"
         f" took {', '.join(sorted(taken))};"
         f" {len(names)} indexes at the ceiling, the primary key one of them;"
-        " a unique index enforced only once its build had finished"
+        " a unique index enforced only once its build had finished, and one"
+        " with a predicate only among the rows it holds"
     )
 
 

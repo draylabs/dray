@@ -670,7 +670,9 @@ class Collection:
         if not any(
             settled.issuperset(str(column) for column in one.columns)
             for one in self.cls.__dray_indexes__
-            if one.unique
+            # Unique over every row. One with a predicate says at most one
+            # among the rows it covers, and this filter may be about the rest.
+            if one.unique and one.where is None
         ):
             return None
         key = tuple(sorted(wanted.items(), key=lambda pair: pair[0]))

@@ -5,6 +5,8 @@ Records against a real database: the schema they imply, and the round trip.
 import dataclasses
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from enum import Enum
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
@@ -7881,6 +7883,518 @@ def test_an_id_of_a_type_a_key_can_hold_is_untouched():
     assert "id text primary key" in schema.create_table(Coded)
     assert "id uuid primary key" in schema.create_table(Minted)
     assert "id uuid primary key" in schema.create_table(Given)
+
+
+def test_an_index_can_cover_some_of_the_rows():
+    """Most of a register is people nobody asks about, and an index over all of
+    it is mostly entries nothing reads, each written on a save all the same. The
+    predicate goes into the statement as text because a `create index` has
+    nowhere to pass a value, and into the name because the columns alone no
+    longer say which index this is."""
+
+    @record(table="person", collection="people",
+            indexes=[index("family_name", where={"status": "volunteer"})])
+    class Person:
+        family_name: str = field(default="")
+        status: str = field(default="enquiry",
+                            choices=("enquiry", "volunteer", "lapsed"))
+
+    assert schema.create_indexes(Person) == [
+        "create index async if not exists person_family_name_4322d7"
+        " on person (family_name) where status = 'volunteer'"
+    ]
+
+
+def test_a_predicate_that_is_not_equality_is_sql_and_says_so():
+    """`is not null`, a range, one of several: none of them is a field and the
+    value it holds, so none of them is a mapping. `Sql` is what a caller
+    already writes for text meant for the statement, and it goes in as it was
+    written."""
+
+    @record(table="person", collection="people",
+            indexes=[index("email", unique=True,
+                           where=Sql("email is not null"))])
+    class Person:
+        email: str | None = field(default=None)
+
+    assert schema.create_indexes(Person) == [
+        "create unique index async if not exists person_email_322548"
+        " on person (email) where email is not null"
+    ]
+
+
+def test_how_a_predicate_is_laid_out_is_not_part_of_its_name():
+    """The name is worked out from the predicate, so anything that moves the
+    name leaves an index behind under the old one. A predicate long enough to
+    need a second line gets reflowed by the first formatter that meets it, and
+    that must not be a reason to build the index again. Its wording is another
+    matter — nothing short of the database can say two spellings mean one
+    thing."""
+
+    def named(where):
+        @record(table="task", collection="tasks",
+                indexes=[index("due_on", where=where)])
+        class Task:
+            due_on: date | None = field(default=None)
+            done_on: date | None = field(default=None)
+
+        (statement,) = schema.create_indexes(Task)
+        return statement.split(" if not exists ")[1].split(" on ")[0]
+
+    one_line = named(Sql("done_on is null and due_on is not null"))
+    reflowed = named(Sql("""
+        done_on is null
+          and due_on is not null
+    """))
+    reworded = named(Sql("due_on is not null and done_on is null"))
+
+    assert one_line == reflowed
+    assert one_line != reworded
+
+
+def test_a_mapping_says_the_same_index_whatever_order_it_was_typed_in():
+    """Two fields in a predicate have no order — every pair has to hold — so
+    the order somebody typed them in is not allowed to choose the name. The
+    same pair twice is one index declared twice, and is refused as that —
+    which it would not be if the two were taken for different rows."""
+
+    with pytest.raises(ValueError, match="leading run"):
+
+        @record(table="shift", collection="shifts",
+                indexes=[index("ward", where={"slot": "night", "open": True}),
+                         index("ward", where={"open": True, "slot": "night"})])
+        class Shift:
+            ward: str = field(default="")
+            slot: str = field(default="")
+            open: bool = field(default=True)
+
+
+def test_the_same_columns_over_different_rows_are_two_indexes(store):
+    """Which is what the six characters are for. Named for their columns these
+    would be one name, and `create index if not exists` would find the first
+    and build the second nowhere."""
+
+    @record(table="person", collection="people",
+            indexes=[index("family_name", where={"status": "volunteer"}),
+                     index("family_name", where={"status": "lapsed"})])
+    class Person:
+        family_name: str = field(default="")
+        status: str = field(default="enquiry")
+
+    store.create(Person)
+    assert schema.drift(store.conn, Person) == []
+    built = {
+        row[0]
+        for row in store.conn.execute(
+            "select indexname from pg_indexes where tablename = 'person'"
+        ).fetchall()
+    }
+    assert {"person_family_name_4322d7", "person_family_name_4dd38d"} <= built
+
+
+def test_a_predicate_edited_later_is_an_index_drift_reports_missing(store):
+    """The failure a chosen name would have had. Under one name the edit builds
+    nothing — `if not exists` finds the old index — so the class says one rule,
+    the table keeps the other, and nothing anywhere disagrees out loud."""
+
+    @record(table="person", collection="people",
+            indexes=[index("family_name", where={"status": "volunteer"})])
+    class Person:
+        family_name: str = field(default="")
+        status: str = field(default="enquiry")
+
+    store.create(Person)
+
+    @record(table="person", collection="people",
+            indexes=[index("family_name", where={"status": "lapsed"})])
+    class Later:
+        family_name: str = field(default="")
+        status: str = field(default="enquiry")
+
+    assert schema.drift(store.conn, Later) == [
+        "person has no index 'person_family_name_4dd38d', which the class "
+        "asks for"
+    ]
+
+
+def test_a_unique_index_over_some_of_the_rows_is_a_rule_about_those(store):
+    """One open signup per person per event, and as many cancelled ones behind
+    it as there were changes of mind. Unique over the pair alone refuses the
+    signup after a cancellation, and no index at all takes the duplicate."""
+
+    @record(table="signup", collection="signups",
+            indexes=[index("person_id", "event_id", unique=True,
+                           where={"state": "open"})])
+    class Signup:
+        person_id: UUID = field()
+        event_id: UUID = field()
+        state: str = field(default="open", choices=("open", "cancelled"))
+
+    store.create(Signup)
+    person, event = uuid4(), uuid4()
+
+    first = store.signups.add(Signup(person_id=person, event_id=event))
+    with pytest.raises(DuplicateRecord) as refused:
+        store.signups.add(Signup(person_id=person, event_id=event))
+    assert refused.value.columns == ("person_id", "event_id")
+
+    first.state = "cancelled"
+    first.save()
+    second = store.signups.add(Signup(person_id=person, event_id=event))
+    second.state = "cancelled"
+    second.save()
+    store.signups.add(Signup(person_id=person, event_id=event))
+
+    assert store.signups.count(equals={"person_id": person}) == 3
+
+
+def test_a_unique_index_with_a_predicate_is_never_in_the_create_table():
+    """A constraint has no `where` to carry. Written into the `create table`
+    without one it would be a rule about every row, which is a different rule
+    and the stricter one — so this kind is a statement of its own on a table
+    being made as well as on one already there."""
+
+    @record(table="signup", collection="signups",
+            indexes=[index("person_id", unique=True, where={"state": "open"}),
+                     index("sent_as", unique=True)])
+    class Signup:
+        person_id: UUID = field()
+        sent_as: str | None = field(default=None)
+        state: str = field(default="open")
+
+    table, *after = schema.statements(Signup)
+
+    assert "constraint signup_sent_as unique (sent_as)" in table
+    assert "person_id" not in table.split("constraint")[1]
+    assert after == [
+        "create unique index async if not exists signup_person_id_eabe91"
+        " on signup (person_id) where state = 'open'"
+    ]
+
+
+def test_every_kind_of_value_a_mapping_holds_is_one_the_database_reads(store):
+    """A value in a predicate is text in a statement, written by dray, so each
+    kind is a way of quoting that has to be right. Built, and then asked for
+    the row each was written to cover — an index whose predicate matched
+    nothing would build just as happily."""
+
+    org, day = uuid4(), date(2026, 3, 14)
+
+    @record(table="entry", collection="entries",
+            indexes=[index("label", where={"word": "o'clock"}),
+                     index("label", where={"org": org}),
+                     index("label", where={"on_day": day}),
+                     index("label", where={"live": True}),
+                     index("label", where={"live": False}),
+                     index("label", where={"count": 7}),
+                     index("label", where={"amount": Decimal("4.99")}),
+                     index("label", where={"word": None})])
+    class Entry:
+        label: str = field(default="")
+        word: str | None = field(default=None)
+        org: UUID | None = field(default=None)
+        on_day: date | None = field(default=None)
+        live: bool = field(default=True)
+        count: int = field(default=0)
+        amount: Decimal = field(default=Decimal("0"), precision=10, scale=2)
+
+    store.create(Entry)
+    store.entries.add(Entry(label="it", word="o'clock", org=org, on_day=day,
+                            live=True, count=7, amount=Decimal("4.99")))
+    store.entries.add(Entry(label="other", live=False))
+
+    predicates = [
+        row[0].split(" WHERE ")[1]
+        for row in store.conn.execute(
+            "select indexdef from pg_indexes"
+            " where tablename = 'entry' and indexdef like '%% WHERE %%'"
+        ).fetchall()
+    ]
+    assert len(predicates) == 8
+    covered = sorted(
+        store.conn.execute(
+            f"select count(*) from entry where {predicate}"
+        ).fetchone()[0]
+        for predicate in predicates
+    )
+    # Each covers the one row written to match it. `live` is true of the
+    # first and false of the second, and only the second has no word.
+    assert covered == [1] * 8
+
+
+def test_a_predicate_goes_through_the_converter_a_filter_would():
+    """A filter meant to reach this index is converted before it is sent, so
+    the index has to be over the converted value or it covers rows no filter
+    ever asks for."""
+
+    @record(table="member", collection="members",
+            indexes=[index("joined_on", where={"tier": "  GOLD "})])
+    class Member:
+        joined_on: date | None = field(default=None)
+        tier: str = field(default="", converter=lambda v: v.strip().lower())
+
+    (statement,) = schema.create_indexes(Member)
+    assert statement.endswith("where tier = 'gold'")
+
+
+def test_a_predicate_dray_cannot_hold_to_the_class_is_refused():
+    """Each of these builds, on either database, and is wrong: an index over a
+    column that is not there fails a deployment, and the rest succeed at
+    covering nothing. All of them are visible on the line that declared them."""
+
+    def declare(where):
+        @record(table="person", collection="people",
+                indexes=[index("family_name", where=where)])
+        class Person:
+            family_name: str = field(default="")
+            status: str = field(default="enquiry",
+                                choices=("enquiry", "volunteer"))
+            suburb: str | None = field(default=None, stored_in="blob")
+            seen_at: datetime | None = field(default=None)
+
+    with pytest.raises(TypeError, match="declares no such field"):
+        declare({"stauts": "volunteer"})
+
+    with pytest.raises(ValueError, match="is not one of enquiry, volunteer"):
+        declare({"status": "voluntear"})
+
+    with pytest.raises(TypeError, match="stored in the blob"):
+        declare({"suburb": "Leura"})
+
+    with pytest.raises(TypeError, match="one of several values is Sql"):
+        declare({"status": any_of("enquiry", "volunteer")})
+
+    with pytest.raises(TypeError, match="does not write a datetime"):
+        declare({"seen_at": datetime(2026, 3, 14, tzinfo=timezone.utc)})
+
+
+def test_a_bare_string_for_a_predicate_is_refused_rather_than_guessed_at():
+    """`where="volunteer"` is a value somebody meant for a mapping at least as
+    often as it is SQL, and taken as SQL it is a column name that fails
+    somewhere else. `Sql` is how a caller says which."""
+    with pytest.raises(TypeError, match="bare string"):
+        index("family_name", where="status = 'volunteer'")
+
+    with pytest.raises(ValueError, match="names no rows"):
+        index("family_name", where={})
+
+    with pytest.raises(ValueError, match="an empty one"):
+        index("family_name", where=Sql("  "))
+
+
+def test_an_index_over_some_rows_and_one_over_all_are_not_redundant():
+    """A leading run makes an index refusable because the wider one answers
+    every read the narrower could. That stops being true the moment they hold
+    different rows: the whole one is the bigger thing to read for a question
+    about the few, and the partial one has nothing to say about the rest."""
+
+    @record(table="person", collection="people",
+            indexes=[index("family_name"),
+                     index("family_name", "suburb"
+                           , where={"status": "volunteer"})])
+    class Person:
+        family_name: str = field(default="")
+        suburb: str = field(default="")
+        status: str = field(default="enquiry")
+
+    assert len(schema.create_indexes(Person)) == 2
+
+    with pytest.raises(ValueError, match="leading run"):
+
+        @record(table="person", collection="people",
+                indexes=[index("family_name", where={"status": "volunteer"}),
+                         index("family_name", "suburb",
+                               where={"status": "volunteer"})])
+        class Again:
+            family_name: str = field(default="")
+            suburb: str = field(default="")
+            status: str = field(default="enquiry")
+
+
+def test_a_child_index_over_some_rows_does_not_stand_in_for_its_parent_index():
+    """An index leading with the two parent columns answers every read through
+    a parent, so dray leaves its own out beside one. Over some of the rows it
+    answers those reads for some of a parent's children — and the delete that
+    takes all of them with their parent is a scan for the rest."""
+
+    @record(table="walker", collection="walkers")
+    class Walker:
+        family_name: str = field(default="")
+
+    @child(of=Walker, name="legs", table="leg",
+           indexes=[index("parent_type", "parent_id", "walked_on",
+                          where={"kind": "night"})])
+    class Leg:
+        walked_on: date | None = field(default=None)
+        kind: str = field(default="day")
+
+    made = schema.create_indexes(Leg)
+    assert len(made) == 2
+    assert made[0] == (
+        "create index async if not exists leg_parent"
+        " on leg (parent_type, parent_id)"
+    )
+    assert made[1].endswith("where kind = 'night'")
+
+
+def test_sql_for_a_predicate_reaches_the_statement_as_it_was_written():
+    """Tidying it is not dray's to do. Closing up the spacing changes a quoted
+    value with two spaces in it into another value, and joins the line after a
+    comment onto the comment — an index over other rows than the ones written,
+    built without a word either time."""
+
+    spaced = Sql("label = 'two  spaces'")
+    commented = Sql("""done_on is null -- still to do
+        and due_on is not null""")
+
+    @record(table="task", collection="tasks",
+            indexes=[index("due_on", where=spaced),
+                     index("done_on", where=commented)])
+    class Task:
+        label: str = field(default="")
+        due_on: date | None = field(default=None)
+        done_on: date | None = field(default=None)
+
+    first, second = schema.create_indexes(Task)
+    assert first.endswith("where label = 'two  spaces'")
+    assert second.endswith(f"where {commented}")
+
+
+def test_a_value_a_mapping_would_write_wrongly_is_refused():
+    """Each of these is a value the field takes and a statement that is wrong.
+    A member of a `str` enum is written by its name rather than its value, so
+    the index is over a word no row holds. A number finer than its column is
+    rounded on the way in and never matches. And something that is not a
+    number at all is a `create index` that fails on a deployment."""
+
+    class Tier(str, Enum):
+        GOLD = "gold"
+
+    def declare(where):
+        @record(table="member", collection="members",
+                indexes=[index("joined_on", where=where)])
+        class Member:
+            joined_on: date | None = field(default=None)
+            tier: str = field(default="")
+            fee: Decimal = field(default=Decimal("0"), precision=10, scale=2)
+            visits: int = field(default=0)
+
+    with pytest.raises(TypeError, match="does not write a Tier"):
+        declare({"tier": Tier.GOLD})
+
+    with pytest.raises(ValueError, match="keeps 2 digits after the point"):
+        declare({"fee": Decimal("4.999")})
+
+    with pytest.raises(ValueError, match="not a number that column holds"):
+        declare({"fee": Decimal("NaN")})
+
+    # A field's own type is checked first, and said as a refusal of the index
+    # rather than of a filter nobody wrote.
+    with pytest.raises(TypeError, match="Member has an index over the rows"):
+        declare({"visits": "seven"})
+
+
+def test_a_decimal_is_named_for_its_value_and_not_its_spelling():
+    """`1.5` and `1.50` are the same rows, so they are the same index and the
+    same name. Named for how each was typed they would be two indexes over one
+    set of rows, and tidying a literal later would be an index `drift` reports
+    missing."""
+
+    def named(fee):
+        @record(table="member", collection="members",
+                indexes=[index("joined_on", where={"fee": fee})])
+        class Member:
+            joined_on: date | None = field(default=None)
+            fee: Decimal = field(default=Decimal("0"), precision=10, scale=2)
+
+        (statement,) = schema.create_indexes(Member)
+        return statement
+
+    assert named(Decimal("1.5")) == named(Decimal("1.50"))
+    assert named(Decimal("100")).endswith("where fee = 100")
+
+
+def test_two_unique_indexes_saying_one_thing_two_ways_are_refused():
+    """A mapping and the SQL it would have been written as are one predicate
+    and one name. The refusal names both as they were declared, since the
+    columns alone are the same list twice and say nothing about why."""
+
+    with pytest.raises(ValueError, match="same thing about which rows") as refused:
+
+        @record(table="signup", collection="signups",
+                indexes=[index("person_id", unique=True,
+                               where={"state": "open"}),
+                         index("person_id", unique=True,
+                               where=Sql("state  =  'open'"))])
+        class Signup:
+            person_id: UUID = field()
+            state: str = field(default="open")
+
+    assert "where={'state': 'open'}" in str(refused.value)
+    assert "where=Sql(\"state  =  'open'\")" in str(refused.value)
+
+
+def test_a_vocabulary_handed_back_by_a_function_is_not_asked_at_declaration():
+    """`choices` as a function is whatever the application has loaded when a
+    value arrives, and a class is declared before any of that. Asking it here
+    would refuse an index over a word that is perfectly good by the time a
+    row is written."""
+
+    @record(table="person", collection="people",
+            indexes=[index("family_name", where={"status": "volunteer"})])
+    class Person:
+        family_name: str = field(default="")
+        status: str = field(default="", choices=lambda: ())
+
+    assert len(schema.create_indexes(Person)) == 1
+
+
+def test_a_long_name_keeps_the_part_that_says_which_rows():
+    """Cut at 63 bytes like any other name, and cut before the six characters
+    go on rather than after. The other way round, two long names differing
+    only in their predicates are cut back into one."""
+
+    @record(table="organisation_membership", collection="memberships",
+            indexes=[index("effective_from", "contribution_level",
+                           "renewed_by_volunteer", where={"level": "gold"}),
+                     index("effective_from", "contribution_level",
+                           "renewed_by_volunteer", where={"level": "silver"})])
+    class Membership:
+        effective_from: date | None = field(default=None)
+        contribution_level: str = field(default="")
+        renewed_by_volunteer: str = field(default="")
+        level: str = field(default="")
+
+    names = [
+        statement.split(" if not exists ")[1].split(" on ")[0]
+        for statement in schema.create_indexes(Membership)
+    ]
+    assert len(set(names)) == 2
+    assert all(len(name.encode()) == 63 for name in names)
+
+
+def test_a_unique_index_with_a_predicate_may_say_where_its_nulls_go(store):
+    """Placement is refused on a unique index because of the `create table`,
+    where `unique (col nulls first)` is not something SQL can say. One with a
+    predicate never goes there, so the reason does not reach it."""
+
+    @record(table="task", collection="tasks",
+            indexes=[index("area", asc("due_on", nulls="first"), unique=True,
+                           where={"open": True})])
+    class Task:
+        area: str = field(default="")
+        due_on: date | None = field(default=None)
+        open: bool = field(default=True)
+
+    (statement,) = schema.create_indexes(Task)
+    assert "(area, due_on nulls first) where open = true" in statement
+
+    store.create(Task)
+    assert schema.drift(store.conn, Task) == []
+    store.tasks.add(Task(area="north", due_on=date(2026, 3, 14)))
+    with pytest.raises(DuplicateRecord):
+        store.tasks.add(Task(area="north", due_on=date(2026, 3, 14)))
+    store.tasks.add(Task(area="north", due_on=date(2026, 3, 14), open=False))
 
 
 def test_the_unindexable_annotations_are_the_columns_the_schema_emits():

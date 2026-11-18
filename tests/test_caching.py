@@ -64,6 +64,15 @@ class Region:
     code: str | None = field(default=None)
 
 
+@record(table="bed", collection="beds", cached_for=30,
+        indexes=[index("label", unique=True, where={"in_use": True})])
+class Bed:
+    """Unique among the beds in use and not among the rest, so a label is a
+    key for some rows and no key at all for the others."""
+    label: str = field(default="")
+    in_use: bool = field(default=True)
+
+
 @record(table="area", collection="areas")
 class Area:
     """A record with no cache of its own, on a collection that keeps an
@@ -128,10 +137,10 @@ def pool(dsn, clock):
         dsn, min_size=1, max_size=6, configure=ready, open=False, timeout=5
     )
     pool = Pool(
-        made, records=[Ward, Visit, Round, Region, Area], timer=clock
+        made, records=[Ward, Visit, Round, Region, Area, Bed], timer=clock
     )
     with pool.store() as store:
-        store.create(Ward, Visit, Round, Region, Area)
+        store.create(Ward, Visit, Round, Region, Area, Bed)
     yield pool
     made.close()
 
@@ -140,7 +149,7 @@ def pool(dsn, clock):
 def cached(store):
     """A store built by hand, with the tables made. The README's own shape, and
     the one with no pool for a cache to live on."""
-    store.create(Ward, Visit, Round, Region, Area)
+    store.create(Ward, Visit, Round, Region, Area, Bed)
     return store
 
 
@@ -561,6 +570,24 @@ def test_a_leading_run_of_a_unique_index_is_not_a_natural_key(pool):
     with pool.store() as store, store.watching() as seen:
         store.wards.find_first(equals={"region": "upper"})
         store.wards.find_first(equals={"region": "upper"})
+
+    assert len(statements(seen)) == 2
+
+
+def test_a_unique_index_over_some_of_the_rows_is_not_a_natural_key(pool):
+    """`unique=True` with a `where=` says at most one among the rows it covers,
+    and a filter naming only its columns may be about the rest. Two beds
+    retired under one label are two rows, and the first of them remembered as
+    the only one is an answer that is wrong for thirty seconds at a time."""
+    with pool.store() as store:
+        store.beds.add_all([
+            Bed(label="4A", in_use=False),
+            Bed(label="4A", in_use=False),
+        ])
+
+    with pool.store() as store, store.watching() as seen:
+        store.beds.find_first(equals={"label": "4A"})
+        store.beds.find_first(equals={"label": "4A"})
 
     assert len(statements(seen)) == 2
 

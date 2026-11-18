@@ -4314,8 +4314,133 @@ class Signup:
 A caller that hands a key of its own gets its second attempt refused, so a form
 submitted twice on a bad line puts one person on the list; a caller that hands
 nothing is unconstrained and costs no row of its own. That is an idempotency
-key in one declaration, without a partial index — `create index … where` comes
-back `FeatureNotSupported` here — and without a second table to keep in step.
+key in one declaration, with no second table to keep in step.
+
+**An index may cover some of the rows rather than all of them.** A register
+holds everybody who ever enquired and is asked, nearly always, about the few who
+volunteer — so an index over all of it is mostly entries nothing reads, each one
+written on a save all the same. `where=` says which rows take one:
+
+```python
+@record(table="person", collection="people",
+        indexes=[index("family_name", where={"status": "volunteer"})])
+class Person:
+    family_name: str
+    status: str = field(default="enquiry", choices=STATUSES)
+```
+
+```sql
+create index async if not exists person_family_name_4322d7
+    on person (family_name) where status = 'volunteer'
+```
+
+The database reaches for it only where the question could not be about any
+other row, which means the question has to say so:
+
+```python
+people.find(equals={"status": "volunteer", "family_name": "Stein"})  # this index
+people.find(equals={"status": "lapsed", "family_name": "Stein"})     # a scan
+people.find(equals={"family_name": "Stein"})                         # a scan
+```
+
+The third is the one to look at twice. It is a narrower question to read and a
+wider one to answer — every Stein, volunteering or not — and an index holding
+only the volunteers has nothing to say about the rest. So this is an index
+*instead of* `index("status", "family_name")` where volunteers are all anybody
+asks about through it, and one *beside* a whole index where they are not.
+
+**With `unique=True` it is a rule about some of the rows**, which is the thing
+no whole index can say:
+
+```python
+@record(table="signup", collection="signups",
+        indexes=[index("person_id", "event_id", unique=True,
+                       where={"state": "open"})])
+class Signup:
+    person_id: UUID = field()
+    event_id: UUID = field()
+    state: str = field(default="open", choices=("open", "cancelled"))
+```
+
+```python
+signups.add(Signup(person_id=ernest.id, event_id=intake.id))
+signups.add(Signup(person_id=ernest.id, event_id=intake.id))
+# DuplicateRecord: a second open signup, refused by the database
+
+first.state = "cancelled"
+first.save()
+signups.add(Signup(person_id=ernest.id, event_id=intake.id))   # taken
+```
+
+One open signup per person per event, and as many cancelled ones behind it as
+there were changes of mind. Unique over the pair alone would refuse the third
+line, and no index at all would take the second.
+
+A row can also arrive among the covered ones by a save — a cancelled signup
+opened again while another is open — and that refusal is the edge under *When it
+goes wrong*: `psycopg.errors.UniqueViolation` from the `save`, where the `add`
+above raised `DuplicateRecord`.
+
+**This one is never in the `create table`.** A constraint written there has no
+`where` to carry, so a unique index with a predicate is always a statement of
+its own — `create unique index async` on a cluster, and the build window
+described further down this section comes with it whether or not the table has
+rows yet. On a table just made the build is over almost as soon as it is asked
+for; on one already holding rows it is the same migration question any
+uniqueness added late is.
+
+**A predicate is written one of two ways, and which one says how much dray
+checks.** A mapping is fields and the values they hold, the same shape `equals=`
+takes and held to the class the same way: a name it never declared is refused,
+a converter runs, and `None` means *is null*. Every pair has to hold, and
+equality is all it says. One thing is checked here that a filter is spared — a
+value outside the field's `choices` is refused, since an index over a word the
+field will not take is built and stays empty. Only a field with a column of its
+own can be named, the same rule as the columns an index covers and for the same
+reason, and the value is text, a whole number, a `Decimal`, a `date`, a `UUID`,
+`True` or `False`.
+
+Anything else is SQL, and says that it is:
+
+```python
+from dray import Sql
+
+index("email", unique=True, where=Sql("email is not null"))
+index("due_on", where=Sql("done_on is null and due_on is not null"))
+```
+
+`Sql` is the name `clock` hands back, and means here what it means there: text
+for the statement, as you wrote it. The names in it are the database's and
+yours to keep right — nothing checks them against the class, and a field
+renamed later is not renamed in there. A bare string is refused rather than
+guessed at, because `where="volunteer"` is a value somebody meant for the first
+form at least as often as it is SQL.
+
+Either way it has to be something true of a row for as long as the row does not
+change. `Sql("due_on > now()")` comes back `functions in index predicate must
+be marked IMMUTABLE`, from a cluster and from local PostgreSQL alike: an index
+is maintained when a row is written, and nothing writes a row on the day it
+falls due.
+
+**The name carries six characters worked out from the predicate** —
+`person_family_name_4322d7` above — because the columns alone no longer say
+which index this is. The same columns over the volunteers and over the lapsed
+are two indexes, and named for their columns they would be one name, with the
+second quietly building nothing.
+
+That it is worked out rather than chosen is the useful part. Edit the predicate
+and the name moves with it: `drift` reports the new index missing, the migration
+builds it, and the class and the table cannot come to say different things under
+one name. The old index stays where it was until you drop it, spending one of
+the table's slots and, where it is unique, still enforcing what it used to. How
+the SQL is laid out does not count towards the name — a line break or a second
+space changes nothing — but its wording does, so `status='volunteer'` rewritten
+as `status = 'volunteer'` is a new name for the same index. The statement itself
+carries the text exactly as you wrote it.
+
+Two indexes are only ever redundant where they hold the same rows. A whole
+index never makes one with a predicate refusable, nor the other way about, since
+neither answers every read the other does.
 
 **A key may say where the empty values go, and may not say a direction.** That
 is DSQL's rule, and placement is worth saying here only because of what it pairs
@@ -4348,7 +4473,8 @@ genuinely disagree and a green suite would have proved nothing. `unique=True`
 will not take a placement either, and that one is dray's own limit rather than
 the database's: the unique kind goes into a `create table` as a constraint,
 `unique (due_on nulls first)` is not a grammar SQL has, and the two tables dray
-writes for would come out indexed differently with nothing to say so.
+writes for would come out indexed differently with nothing to say so. A unique
+index with a `where=` is never a constraint, and so may say both.
 
 **A composite mixing directions cannot be indexed at all**, which is worth
 knowing because it is a shape a busy read reaches for. `order by area_id,
@@ -4469,12 +4595,9 @@ put those columns in front of a declaration that does not name them.
 > choosing, so the same code makes the same schema either side.
 
 A statement you write yourself is also where you would reach for a shape DSQL
-does not have, so the refusals are worth knowing by sight. A partial index —
-`where status = 'volunteer'`, so that only the rows anybody asks about take an
-entry — comes
-back with `WHERE not supported for CREATE INDEX`. A sort order on a key
+does not have, so the refusals are worth knowing by sight. A sort order on a key
 comes back `specifying sort order not supported for index keys`, so
-`(starts_on desc)` is not a shape either. And the `async` above is not a
+`(starts_on desc)` is not a shape. And the `async` above is not a
 preference: a plain `create index` is answered with `unsupported mode. please use
 CREATE INDEX ASYNC.`, a unique one no differently, and `alter table … add
 constraint … unique` with `unsupported ALTER TABLE ADD CONSTRAINT statement`.
@@ -4485,8 +4608,9 @@ Two more are worth knowing because of what people reach for them for. An
 operator class on a key — `(family_name text_pattern_ops)` — comes back `opclass
 not supported for index keys`, and another index method — `using gin` — comes
 back `USING not supported for CREATE INDEX`. Between them they are why `index()`
-takes column names, a placement and a uniqueness flag and nothing else: there is
-no third thing a key can carry here, so there is nothing for a class to say.
+says which columns, where their empty values go, whether they are unique and
+which rows are covered, and nothing about how a key is compared or stored: there
+is one way here, so there is nothing for a class to say.
 
 Which matters most for a name at a counter. On PostgreSQL `like 'rob%'` will
 not use a plain index unless the database collates as `C`, and the usual answer
@@ -4593,47 +4717,6 @@ that second attempt is yours to make — the refusal arrives at the `with` as
 Your own check narrows the window rather than closing it — two callers can both
 read and both insert — which is the argument for the first move wherever the
 choice is still open.
-
-> **A way to say it here.** A predicate an index will not take goes in a column
-> instead. What the partial index above was for — the people who are volunteers,
-> out of everybody who has ever enquired — is an ordinary composite once a field
-> carries that state: `(volunteer_suburb, family_name)`, where `volunteer_suburb`
-> says where this person volunteers and says nothing while they are not one. What
-> that gives up is the storage, since every row takes an entry where a partial
-> index would have skipped most of them. What it keeps is the read, which is what
-> DSQL charges for: a scan touches the entries that match either way.
-
-Which leaves a column to be kept true, and one computed from other fields is
-wrong the first time somebody saves a record without thinking of it. `derived`
-is what stops that:
-
-```python
-def where_they_volunteer(write: Write) -> str:
-    person = write.record
-    return person.suburb or "" if person.status == "volunteer" else ""
-
-
-@record(table="person", collection="people",
-        indexes=[index("volunteer_suburb", "family_name")])
-class Person:
-    family_name: str
-    suburb: str | None = field(default=None)
-    status: str = field(default="enquiry", choices=STATUSES)
-
-    volunteer_suburb: str = field(default="", derived=where_they_volunteer)
-```
-
-The column is worked out from the two fields it is about on every write, and it
-is nobody's to set — *A field that is never yours*, above. So there is no writer
-left who can forget it and none who can put something else there, which is what
-makes it worth holding an index over: what the read matches on is maintained by
-the same write that moves what it is derived from.
-
-Note the empty string rather than a `None`. A handler handing back `None` is one
-with nothing to say, and the field keeps what it had — which is what `whoever`
-wants and the opposite of what this wants, because somebody who lapsed a month
-ago and still reads as volunteering in Katoomba is the bug the column was built
-to avoid, one layer down.
 
 One shape DSQL does take is worth its own paragraph, because AWS recommend it
 and it lands differently on dray's two kinds of read. The [SQL dialect

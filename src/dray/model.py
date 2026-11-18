@@ -605,9 +605,19 @@ class Index:
 
     columns: tuple[str, ...]
     unique: bool = False
+    # Which rows it covers, where that is not all of them: `Sql` as it was
+    # written, or the pairs of a mapping. The pairs are as the caller gave them
+    # until a class has been through `_declared_indexes`, and converted and in
+    # name order after it — so two indexes saying one thing compare equal
+    # however each was typed.
+    where: Any = None
 
 
-def index(*columns: str, unique: bool = False) -> Index:
+def index(
+    *columns: str,
+    unique: bool = False,
+    where: Mapping[str, Any] | Sql | None = None,
+) -> Index:
     """
     An index over one column or several.
 
@@ -641,28 +651,79 @@ def index(*columns: str, unique: bool = False) -> Index:
     for index keys`, so `index(desc("due_on"))` is refused where the class is
     written. Nothing is lost by that — a btree is scanned backwards as readily
     as forwards, so the index a bare name gives already serves the descending
-    read. A partial index is refused by the cluster outright and is not
-    expressible here or in a migration written by hand.
+    read.
 
     Placement and `unique=True` do not go together, and that is dray's own
     limit. The unique kind arrives as a constraint inside a `create table`,
     where `unique (due_on nulls first)` is not a grammar SQL has — so the two
     tables dray writes for would be indexed differently. Drop the placement:
     what a bare name gives is the index the constraint brings anyway, and it
-    serves the default ordering forwards and backwards alike.
+    serves the default ordering forwards and backwards alike. A unique index
+    with a `where=` is the one that may say both, since it is never a
+    constraint.
+
+    `where=` is which rows the index covers, where that is not all of them:
+
+        index("family_name", where={"status": "volunteer"})
+        index("person_id", "event_id", unique=True, where={"state": "open"})
+        index("email", unique=True, where=Sql("email is not null"))
+
+    A mapping is fields and the values they hold, every pair of which has to
+    be true of a row for it to take an entry. The names are checked against the
+    class, the values go through the field's converter, and `None` means *is
+    null*. Anything that is not equality is `Sql`, which goes into the
+    statement as written and is checked by nobody but the database.
+
+    A read uses such an index only where it could not be about any other row,
+    so `find(equals={"family_name": "Stein"})` scans past the first of those
+    and `find(equals={"status": "volunteer", "family_name": "Stein"})` does
+    not. With `unique=True` the columns are unique among the rows covered and
+    unconstrained among the rest. That kind is never a constraint in the
+    `create table`, which has no way to say `where`, so on a cluster it is
+    always a `create unique index async` and enforces nothing until its build
+    has finished.
 
     The name is dray's — the table and then the columns — and it is cut to the
     63 bytes an identifier holds, which is what the database would have done to
-    it anyway. Two on one table that come out of that cut as the same name are
-    refused where the class is written, because `create index if not exists`
-    would find the first and build the second nowhere.
+    it anyway. One with a `where=` ends in six characters worked out from the
+    predicate, so that the same columns over different rows are different
+    names, and so that a predicate edited later is an index `drift` reports
+    missing rather than one left quietly saying what it used to. Two on one
+    table that come out as the same name are refused where the class is
+    written, because `create index if not exists` would find the first and
+    build the second nowhere.
     """
     if not columns:
         raise ValueError(
             "index() takes the columns it covers, and an index over none of "
             "them is not one. Name at least one field."
         )
-    return Index(tuple(columns), unique)
+    if where is None or isinstance(where, Sql):
+        if where is not None and not where.strip():
+            raise ValueError(
+                "where=Sql(...) is the predicate of the index, and an empty "
+                "one covers nothing that leaving it off would not."
+            )
+        return Index(tuple(columns), unique, where)
+    if isinstance(where, str):
+        raise TypeError(
+            f"where={where!r} is a bare string, which could be a value or "
+            "could be SQL and is refused rather than guessed at. Fields and "
+            'the values they hold are a mapping — where={"status": '
+            '"volunteer"} — and anything else is where=Sql("..."), which '
+            "goes into the statement as written."
+        )
+    if not isinstance(where, Mapping):
+        raise TypeError(
+            f"where= takes a mapping of fields to the values they hold, or "
+            f"Sql(...), not {where!r}."
+        )
+    if not where:
+        raise ValueError(
+            "where={} names no rows, and an index over all of them is the one "
+            "leaving it off gives."
+        )
+    return Index(tuple(columns), unique, tuple(where.items()))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1615,7 +1676,114 @@ def _as_written(one: Index) -> str:
     """One index said back the way the decorator said it, for a refusal that
     has to name two of them against the lines that declared them."""
     said = ", ".join(repr(str(name)) for name in one.columns)
-    return f"index({said}, unique=True)" if one.unique else f"index({said})"
+    if one.unique:
+        said += ", unique=True"
+    if isinstance(one.where, Sql):
+        said += f", where=Sql({str(one.where)!r})"
+    elif one.where is not None:
+        said += f", where={dict(one.where)!r}"
+    return f"index({said})"
+
+
+# What a value in a `where=` mapping may be, which is what `schema` knows how
+# to write into a statement. A `create index` takes no parameters, so the value
+# is text in it, and each kind admitted here is one more way of quoting that
+# has to be right on both databases. These are the ones a predicate is ever
+# about; a `datetime` or a `float` in one is `Sql` and somebody's own care.
+PREDICATE_VALUES = (str, bool, int, Decimal, date, UUID)
+
+
+def _covered(built: type, one: Index) -> Index:
+    """
+    An index whose `where=` is a mapping, with that mapping held to the class:
+    the same index back, carrying converted values in name order.
+
+    Held as a filter is — a declared name, the field's converter, the field's
+    type — because that is what a filter meant to reach this index will be put
+    through, and the two have to arrive at one value. And then by one thing a
+    filter is spared. `choices` does not run on a read, so that rows holding a
+    retired word stay findable; an index is about rows still to be written, and
+    one over a word the field will not take is a slot spent on a typing
+    mistake that builds, covers nothing, and says so to nobody.
+    """
+    pairs = {}
+    for name, value in one.where:
+        rules = built.__dray_fields__.get(name)
+        if rules is None:
+            raise TypeError(
+                f"{built.__name__} has an index over the rows where "
+                f"{name!r} is {value!r}, and declares no such field. Name a "
+                "field it has, or write the predicate as Sql(...)."
+            )
+        if name in built.__dray_blob__:
+            raise TypeError(
+                f"{built.__name__} has an index over the rows where "
+                f"{name!r} is {value!r}, and that field is stored in the "
+                "blob. A mapping names fields with a column of their own, the "
+                "same as the columns an index covers. Give it one by dropping "
+                'stored_in="blob", or write the predicate as Sql(...) and '
+                "spell the document out yourself."
+            )
+        if isinstance(value, (AnyOf, NoneOf)):
+            raise TypeError(
+                f"{built.__name__} has an index over the rows where "
+                f"{name!r} is {value!r}. A mapping says what a field equals "
+                "and nothing else; one of several values is Sql(...)."
+            )
+        try:
+            value = comparable(name, value, rules)
+        except ValidationError as error:
+            # `comparable` speaks of a filter, which is what it was written
+            # for and not what anybody declaring an index is looking at.
+            raise TypeError(
+                f"{built.__name__} has an index over the rows where "
+                f"{name!r} is {value!r}, which is not a value that field "
+                f"holds — {error}"
+            ) from None
+        # The type itself and nothing descended from it. A `datetime` is a
+        # `date` and a member of a `str` enum is a `str` as far as `isinstance`
+        # goes, and neither is written the way its parent is.
+        if value is not None and type(value) not in PREDICATE_VALUES:
+            raise TypeError(
+                f"{built.__name__} has an index over the rows where "
+                f"{name!r} is {value!r}, and dray does not write a "
+                f"{type(value).__name__} into a statement. Text, a whole "
+                "number, a Decimal, a date, a UUID, True, False and None are "
+                "what a mapping holds; write this one as Sql(...)."
+            )
+        if isinstance(value, Decimal):
+            # Two ways a number builds an index that stays empty. Neither is
+            # refused by a database: one is a statement that fails, and the
+            # other compares a column against a value it rounds away on the
+            # way in and so never holds.
+            scale = rules.get("scale")
+            if scale is None:
+                from dray.schema import DECIMAL_SCALE as scale
+            if not value.is_finite() or value != round(value, scale):
+                raise ValueError(
+                    f"{built.__name__} has an index over the rows where "
+                    f"{name!r} is {value!r}, which is not a number that "
+                    f"column holds: it keeps {scale} digits after the point "
+                    "and rounds what is written to it, so no row would match."
+                )
+        choices = rules.get("choices")
+        # Only a vocabulary that is fixed. One handed back by a function is
+        # whatever the application has loaded by the time a value arrives, and
+        # the class is declared before any of that.
+        if (
+            value is not None
+            and choices is not None
+            and not callable(choices)
+            and value not in choices
+        ):
+            allowed = ", ".join(str(choice) for choice in choices)
+            raise ValueError(
+                f"{built.__name__} has an index over the rows where "
+                f"{name!r} is {value!r}, which is not one of {allowed}. No "
+                "row can hold it, so the index would be built and stay empty."
+            )
+        pairs[name] = value
+    return dataclasses.replace(one, where=tuple(sorted(pairs.items())))
 
 
 def _declared_indexes(built: type, given: Any) -> tuple:
@@ -1656,6 +1824,11 @@ def _declared_indexes(built: type, given: Any) -> tuple:
                 "index(...), which is what carries the columns and whether they "
                 "are unique together."
             )
+    declared = tuple(
+        _covered(built, one) if isinstance(one.where, tuple) else one
+        for one in declared
+    )
+    for one in declared:
         for name in one.columns:
             if name not in built.__dray_fields__:
                 raise TypeError(
@@ -1683,7 +1856,10 @@ def _declared_indexes(built: type, given: Any) -> tuple:
                     "desc() belongs in order_by; asc(name, nulls=...) is what "
                     "an index key may say."
                 )
-            if one.unique and _nulls(name):
+            # Only the kind that goes into a `create table`. One with a
+            # predicate is a statement of its own on either table, and a key
+            # there may say where its empty values go.
+            if one.unique and one.where is None and _nulls(name):
                 raise ValueError(
                     f"{built.__name__} indexes {str(name)!r} with a null "
                     "placement and unique=True together, which dray cannot "
@@ -1700,6 +1876,8 @@ def _declared_indexes(built: type, given: Any) -> tuple:
     # An index is skipped against itself by position rather than by value,
     # because two declarations can be equal — `index("email")` said twice is
     # this same mistake — and skipping by value would take that pair with it.
+    from dray.schema import _index_name, _predicate
+
     for here, narrow in enumerate(declared):
         # A unique index is never the redundant one. It enforces something no
         # wider index does, whatever their columns share.
@@ -1707,6 +1885,12 @@ def _declared_indexes(built: type, given: Any) -> tuple:
             continue
         for there, wider in enumerate(declared):
             if here == there or len(wider.columns) < len(narrow.columns):
+                continue
+            # Only between two that hold the same rows. An index over some of
+            # them answers nothing about the rest, and one over all of them is
+            # the bigger thing to read for a question about the few — so
+            # neither stands in for the other, whatever columns they share.
+            if _predicate(narrow) != _predicate(wider):
                 continue
             if wider.columns[: len(narrow.columns)] != narrow.columns:
                 continue
@@ -1723,17 +1907,23 @@ def _declared_indexes(built: type, given: Any) -> tuple:
     # Asked of the one function that names an index, rather than of a second
     # copy of the rule here. The whole failure below is a name generated one way
     # and stored another, and two places building it is how that starts again.
-    from dray.schema import _index_name
-
     named: dict[str, Index] = {}
     for one in declared:
         called = _index_name(built, one)
         if called in named:
-            first = ", ".join(str(column) for column in named[called].columns)
-            second = ", ".join(str(column) for column in one.columns)
+            first, second = _as_written(named[called]), _as_written(one)
+            if one.where is not None:
+                raise ValueError(
+                    f"{built.__name__} declares two indexes that dray calls "
+                    f"the same thing: {first} and {second} are both "
+                    f"{called!r}. They cover the same columns and say the "
+                    "same thing about which rows, so the statement for the "
+                    "second — `create index if not exists` — finds the first "
+                    "and succeeds having built nothing. Drop one of them."
+                )
             raise ValueError(
                 f"{built.__name__} declares two indexes that dray calls the "
-                f"same thing: ({first}) and ({second}) are both "
+                f"same thing: {first} and {second} are both "
                 f"{called!r}. An index is named for its table and its columns, "
                 "cut to the 63 bytes an identifier holds, and the statement "
                 "for one is `create index if not exists` — so the second finds "
