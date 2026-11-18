@@ -879,17 +879,19 @@ def convert(name: str, value: Any, rules: Mapping[str, Any]) -> Any:
 
 
 # What DSQL will take for a `numeric` column, from its own table of supported
-# types. Local PostgreSQL takes a precision of up to 1,000, so a column
-# declared past this is one more thing local PostgreSQL builds and a cluster
-# refuses — except that here the cluster refuses the `create table` rather than
-# the value, which is a deployment stopping on a statement dray wrote.
+# types — and local PostgreSQL's ceiling as well, so a size refused here is one
+# neither would build. It is refused all the same, because the alternative is a
+# `create table` that fails wherever it is first run, on a statement dray wrote.
+#
+# There is no ceiling on the scale to go with it. Both databases take one up to
+# the same thousand, and a scale is refused past its own precision before it
+# could get there.
 #
 # The ceiling is here because refusing a declaration is this module's work. The
 # default size a column gets when nobody declares one belongs to
 # `schema.SQL_TYPES`, because it is written into a statement and nothing here
 # knows about SQL.
-MAX_PRECISION = 38
-MAX_SCALE = 37
+MAX_PRECISION = 1000
 
 
 def check_size(precision: int | None, scale: int | None) -> None:
@@ -917,10 +919,10 @@ def check_size(precision: int | None, scale: int | None) -> None:
             "than by the cluster, which would refuse the create table and stop "
             "a deployment on a statement dray wrote."
         )
-    if not 0 <= scale <= MAX_SCALE:
+    if scale < 0:
         raise ValueError(
-            f"scale {scale} is outside what DSQL holds in a numeric column, "
-            f"which is 0 to {MAX_SCALE} digits after the point."
+            f"scale {scale} is less than zero, and a scale here is how many "
+            "digits a column keeps after the point."
         )
     if scale > precision:
         raise ValueError(

@@ -52,7 +52,7 @@ from dray import (
     schema,
 )
 from dray.collection import MAX_ROWS
-from dray.model import UNINDEXABLE
+from dray.model import MAX_PRECISION, UNINDEXABLE
 
 CHECKS: list[tuple[str, Callable]] = []
 RUN = uuid.uuid4().hex[:8]
@@ -1296,12 +1296,22 @@ def _numeric_size(pool: Pool, table: str) -> str:
     at either end. Local PostgreSQL now rounds identically — what it cannot say
     is that eighteen and six are still DSQL's default, or that a declared size
     reaches the cluster at all.
+
+    And that the ceiling is where `MAX_PRECISION` puts it, from both sides. A
+    column at it has to be built, or dray is allowing a class the cluster will
+    not; one past it has to be refused, or dray is refusing a class the cluster
+    would have taken — which is the direction nothing else would ever report.
     """
 
     @record(table=table, collection=f"c_{RUN}_numeric")
     class Rate:
         default_size: Decimal | None = field()
         declared: Decimal | None = field(precision=12, scale=8)
+        widest: Decimal | None = field(
+            precision=MAX_PRECISION, scale=MAX_PRECISION
+        )
+
+    finest = Decimal(1).scaleb(-MAX_PRECISION)
 
     with pool.store(records=[Rate]) as store:
         store.create(Rate)
@@ -1310,6 +1320,7 @@ def _numeric_size(pool: Pool, table: str) -> str:
             Rate(
                 default_size=Decimal("0.00012345"),
                 declared=Decimal("0.00012345"),
+                widest=finest,
             )
         )
         back = collection.by_id(written.id)
@@ -1322,10 +1333,21 @@ def _numeric_size(pool: Pool, table: str) -> str:
                 [table],
             )
             sizes = {row[0]: (row[1], row[2]) for row in cur.fetchall()}
+        past = MAX_PRECISION + 1
+        if ddl(
+            store.conn,
+            f"alter table {table} add column past numeric({past},0)",
+            tolerate=(psycopg.errors.InvalidParameterValue,),
+        ):
+            raise AssertionError(
+                f"the cluster took numeric({past},0), so the ceiling dray "
+                f"refuses at is lower than the cluster's own"
+            )
 
     wanted = {
         "default_size": (schema.DECIMAL_PRECISION, schema.DECIMAL_SCALE),
         "declared": (12, 8),
+        "widest": (MAX_PRECISION, MAX_PRECISION),
     }
     if sizes != wanted:
         raise AssertionError(f"the cluster made {sizes}, not {wanted}")
@@ -1338,7 +1360,14 @@ def _numeric_size(pool: Pool, table: str) -> str:
         raise AssertionError(
             f"a column declared to eight places rounded anyway: {back.declared}"
         )
-    return "numeric(18,6) rounded at six places, numeric(12,8) kept eight"
+    if back.widest != finest:
+        raise AssertionError(
+            f"a column at the ceiling lost digits: {back.widest}, not {finest}"
+        )
+    return (
+        "numeric(18,6) rounded at six places, numeric(12,8) kept eight, and "
+        f"the ceiling is {MAX_PRECISION}"
+    )
 
 
 @check("drift")

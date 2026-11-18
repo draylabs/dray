@@ -7903,18 +7903,46 @@ def test_the_unindexable_annotations_are_the_columns_the_schema_emits():
 
 
 def test_a_size_past_what_dsql_holds_is_refused_at_declaration():
-    """The cluster's ceiling is a precision of 38 and a scale of 37, where local
-    PostgreSQL takes a precision of 1,000 — so a column declared past it is the
-    familiar shape one notch worse: not a value that differs by where it ran,
-    but a `create table` local PostgreSQL builds and a deployment stops on."""
-    with pytest.raises(ValueError, match="precision 39 is outside"):
-        field(precision=39, scale=6)
+    """The cluster's ceiling is a precision of 1,000, which is local
+    PostgreSQL's as well — so a column declared past it is refused by both, and
+    refused here first so that it is the class that fails rather than a
+    `create table` dray wrote. A scale has no ceiling of its own, because it is
+    held to its precision before it could reach one."""
+    with pytest.raises(ValueError, match="precision 1001 is outside"):
+        field(precision=1001, scale=6)
 
-    with pytest.raises(ValueError, match="scale 38 is outside"):
-        field(precision=38, scale=38)
+    with pytest.raises(ValueError, match="precision 0 is outside"):
+        field(precision=0, scale=0)
+
+    with pytest.raises(ValueError, match="scale -2 is less than zero"):
+        field(precision=8, scale=-2)
 
     with pytest.raises(ValueError, match="more than precision"):
         field(precision=8, scale=12)
+
+
+def test_a_size_at_the_ceiling_is_taken_and_keeps_every_digit(store):
+    """The widest column there is, and all of it after the point — which is the
+    declaration a ceiling of 38 used to refuse. Written and read back so that
+    what is pinned is the digits surviving the trip rather than the statement
+    being accepted."""
+
+    @record(table="widest", collection="widest")
+    class Widest:
+        whole: Decimal = field(precision=1000, scale=0)
+        fraction: Decimal = field(precision=1000, scale=1000)
+
+    assert "whole numeric(1000,0)" in schema.create_table(Widest)
+    assert "fraction numeric(1000,1000)" in schema.create_table(Widest)
+
+    whole = Decimal("9" * 1000)
+    fraction = Decimal("0." + "123456789" * 111 + "1")
+
+    store.create(Widest)
+    written = store.widest.add(Widest(whole=whole, fraction=fraction))
+    back = store.widest.by_id(written.id)
+    assert back.whole == whole
+    assert back.fraction == fraction
 
 
 def test_a_precision_and_a_scale_are_said_together():

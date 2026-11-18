@@ -1710,9 +1710,10 @@ which is `rate numeric(12,8)` in the `create table`. They are the words DSQL's
 own documentation and `information_schema` use, and the words in the statement
 you read before running it. Say both or neither — `numeric(12)` alone means a
 scale of zero, and rounds away everything after the point. DSQL holds a
-precision of 38 and a scale of 37 at the most, and a class asking for more is
-refused where it is declared rather than by the cluster when somebody deploys
-it. So is a size on a field that is not a `Decimal`, or one in the blob: a
+precision of 1,000 at the most, every digit of it after the point if that is
+what the scale says, and a class asking for more is refused where it is
+declared rather than by the cluster when somebody deploys it. So is a scale
+below zero, a size on a field that is not a `Decimal`, or one in the blob: a
 document holds a decimal as its own text and hands it back whole, so there is
 nothing there to round.
 
