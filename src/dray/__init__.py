@@ -43,6 +43,7 @@ from dray.model import (
 from dray.store import (
     AfterCommitFailed,
     CommitRefused,
+    CommitUncertain,
     ConcurrencyExhausted,
     ConnectionLost,
     DuplicateRecord,
@@ -50,6 +51,7 @@ from dray.store import (
     Pool,
     RecordNotFound,
     Store,
+    Unavailable,
     replaying,
     retrying,
 )
@@ -67,6 +69,7 @@ __all__ = [
     "Change",
     "Collection",
     "CommitRefused",
+    "CommitUncertain",
     "ConcurrencyExhausted",
     "ConnectionLost",
     "DrayError",
@@ -79,6 +82,7 @@ __all__ = [
     "Span",
     "Sql",
     "Store",
+    "Unavailable",
     "ValidationError",
     "Write",
     "after_commit",

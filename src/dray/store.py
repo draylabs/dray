@@ -220,6 +220,71 @@ def _clash(cls: type, record: Any, error: Any) -> "DuplicateRecord":
     return DuplicateRecord(message, columns=columns, constraint=constraint)
 
 
+class Unavailable(DrayError, psycopg.InternalError):
+    """
+    DSQL answered `server unavailable` before a commit was sent. **The
+    transaction that met it did not land.**
+
+    A passing condition on the cluster's side: the connection is still good
+    and the store is still usable. dray does not run the work again, and this
+    name is what says it would be safe to — the statement that raised was a
+    read, or was inside a transaction that had not been committed.
+
+    A write that is several transactions can have landed some of them first,
+    and `written` holds those as it does for any failure partway. Inside a
+    `store.transaction()` the caller opened, the transaction that did not land
+    is that whole block, and the block is what there is to run again.
+
+    A `psycopg.InternalError` still, because that is what it is and what
+    anybody already handling the driver's error catches.
+    """
+
+
+class CommitUncertain(DrayError, psycopg.InternalError):
+    """
+    DSQL answered `server unavailable` in place of a commit's answer. **The
+    rows may have landed, and nothing on this side knows.**
+
+    Which is the whole reason it is not `Unavailable`. Almost everything that
+    comes out of a write says the work did not land, and `AfterCommitFailed`
+    says that it did; this is the third answer, and treating it as the first
+    is how a write that landed is run a second time — a duplicate refused as
+    somebody else's, a guarded save told the record changed, a line logged
+    twice.
+
+    It is also what a statement of the caller's own gets when it is run outside
+    any transaction, since such a statement commits by itself and dray cannot
+    tell a read from a write in SQL it did not build.
+
+    `unsettled` is the keys of the records an `add`, a `save`, their bulk
+    forms or a `delete` was carrying in the commit that went unanswered, which
+    is what to read back before deciding. Their children are not listed and
+    went with them or did not. Beside it, `written` is the chunks before that
+    one which certainly landed. Empty for everything else: a block the caller
+    opened, a statement of the caller's own, a write made on a child set.
+    """
+
+    unsettled: tuple = ()
+
+
+def unavailable(error: BaseException) -> bool:
+    """
+    Whether an error is DSQL saying it is briefly not there.
+
+    By the message as well as the code. `XX000` is every internal error a
+    database has no better code for, and the rest of them are faults rather
+    than a moment to wait out — so only the message AWS's guide gives for the
+    passing condition is given a name, and anything else under that code goes
+    up as it came. From the start of the message's own line, so that those
+    words turning up further along in some other error are not taken for it.
+    """
+    if getattr(error, "sqlstate", None) != "XX000":
+        return False
+    diag = getattr(error, "diag", None)
+    said = getattr(diag, "message_primary", None) or str(error)
+    return said.strip().lower().startswith("server unavailable")
+
+
 class ConcurrencyExhausted(DrayError, RuntimeError):
     """Replayed until the attempts ran out and still conflicted."""
 
@@ -266,11 +331,12 @@ class AfterCommitFailed(DrayError, RuntimeError):
     """
     One or more `after_commit` handlers raised. **The rows are committed.**
 
-    Which is the whole reason this has a name of its own. Everything else that
-    comes out of a `with store.transaction()` means the work did not land, so a
-    caller catching broadly and treating failure as "it did not happen" is right
-    about all of them and wrong about this one — and running the work again here
-    writes it twice.
+    Which is the whole reason this has a name of its own. Nearly everything
+    else that comes out of a `with store.transaction()` means the work did not
+    land, so a caller catching broadly and treating failure as "it did not
+    happen" is right about those and wrong about this one — and running the
+    work again here writes it twice. `CommitUncertain` is the other that is
+    not a plain no.
 
     The handlers are independent of each other, so one raising does not stop the
     rest: every one is run, and `failures` holds what they raised, in the order
@@ -576,7 +642,7 @@ def _replays(work: Callable, attempts: int) -> Callable:
 
 
 @contextmanager
-def explaining(conn: psycopg.Connection) -> Iterator[None]:
+def explaining(conn: psycopg.Connection, *, theirs: bool = False) -> Iterator[None]:
     """
     Say what a connection closed underneath dray means, where psycopg says only
     that it is closed.
@@ -602,12 +668,39 @@ def explaining(conn: psycopg.Connection) -> Iterator[None]:
     connection at `begin` and never reaches a statement. One or the other would
     be a message that covers `find` and misses `save`.
     """
+    # Asked before the statement, because afterwards the answer is the same
+    # either way. With no transaction open a statement is one all by itself
+    # and commits as it finishes, so an error out of it is an error out of a
+    # commit.
+    alone = conn.info.transaction_status == TransactionStatus.IDLE
     try:
         yield
     except ConnectionLost:
         # Said already, one level down: a write that got its `begin` in and then
         # lost the connection would otherwise be told the same thing twice.
         raise
+    except psycopg.InternalError as error:
+        if not unavailable(error):
+            raise
+        # A commit of dray's own never reaches here as the driver's error —
+        # `_transacting` names it first. What is left is a statement, and the
+        # one question is whether it could have committed anything by itself:
+        # only where no transaction was open around it, and only where it is
+        # SQL the caller wrote, since every statement dray builds to run that
+        # way is a read.
+        if alone and theirs:
+            raise CommitUncertain(
+                "DSQL answered `server unavailable` to a statement run "
+                "outside any transaction, which commits by itself. If it "
+                "wrote anything, that may have landed and may not have: look "
+                "before running it again."
+            ) from error
+        raise Unavailable(
+            "DSQL answered `server unavailable` before a commit was sent, so "
+            "the transaction that met it did not land. It is a passing "
+            "condition and the store is still usable: run the work again — "
+            "the whole block, where it was inside one you opened."
+        ) from error
     except psycopg.OperationalError as error:
         if not conn.broken:
             raise
@@ -630,9 +723,14 @@ def cursor(
     *,
     watch: Any = UNWATCHED,
     cls: type | None = None,
+    theirs: bool = False,
 ) -> Iterator[Any]:
     """
     A cursor that hands rows back as tuples, whatever the connection prefers.
+
+    `theirs` says the statement is one the caller wrote, or one that changes
+    something, rather than a read dray built — which is what `explaining`
+    needs to know to say what an unavailable cluster left behind.
 
     Every cursor dray opens says what it wants and inherits nothing. A
     connection handed over is one an application already built, and it may carry
@@ -662,7 +760,7 @@ def cursor(
     watching hands back the driver's cursor untouched, so there is not even a
     wrapper between the statement and the socket.
     """
-    with explaining(conn), conn.cursor(row_factory=rows) as cur:
+    with explaining(conn, theirs=theirs), conn.cursor(row_factory=rows) as cur:
         if not watch:
             yield cur
             return
@@ -1241,8 +1339,38 @@ class Store:
                 else:
                     with self._watch.span("transaction") as span:
                         span.attempt = self._attempt
-                        with self._conn.transaction():
-                            yield self._conn
+                        # Whether the body got to its end, which is the only
+                        # thing that tells an error out of the commit from one
+                        # out of a statement.
+                        sent = False
+                        try:
+                            with self._conn.transaction():
+                                yield self._conn
+                                sent = True
+                        except psycopg.InternalError as error:
+                            if not (sent and unavailable(error)):
+                                raise
+                            # Everything, and before anybody can ask. What
+                            # the read cache holds was true before this commit
+                            # and may not be now, and the first thing a caller
+                            # is told to do is read — which has to reach the
+                            # database rather than a copy from before.
+                            self._caches.forget_all()
+                            unsure = CommitUncertain(
+                                "DSQL answered `server unavailable` in place "
+                                "of the commit's answer, so the rows may have "
+                                "landed and may not have. Read the records "
+                                "back before writing them again, and go on "
+                                "from what you read rather than from the "
+                                "records in hand: run blind, a write that did "
+                                "land is refused as a duplicate or as changed "
+                                "by somebody else, or lands twice."
+                            )
+                            # Whose commit it was, so that a write this passes
+                            # through on its way up does not take it for its
+                            # own and name records that certainly rolled back.
+                            unsure._store = self
+                            raise unsure from error
                         # The `with` above sends the COMMIT on its way out, so
                         # reaching here is the rows being durable. Anything that
                         # raises from this point on — a handler, the tidying —
@@ -1711,7 +1839,7 @@ class Store:
         being run twice whatever happens, because DSQL cannot commit the
         statement and the row recording it together.
         """
-        with cursor(self.conn, watch=self._watch) as cur:
+        with cursor(self.conn, watch=self._watch, theirs=True) as cur:
             cur.execute(statement)
 
     @property

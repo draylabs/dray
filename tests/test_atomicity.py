@@ -12,6 +12,8 @@ So these run the same write both ways. A test that only ran one of them is what
 let it through.
 """
 
+from contextlib import contextmanager
+
 import psycopg
 import pytest
 from psycopg.pq import TransactionStatus
@@ -19,8 +21,11 @@ from psycopg.pq import TransactionStatus
 from dray import (
     AfterCommitFailed,
     CommitRefused,
+    CommitUncertain,
+    DrayError,
     RecordHasChanged,
     Store,
+    Unavailable,
     after_commit,
     child,
     field,
@@ -1486,3 +1491,354 @@ def test_a_queued_child_reaches_the_store_its_parents_write_went_through(kitchen
     kitchen.rotas.add(rota)
 
     assert seen == [1]
+
+
+GONE = """
+create function gone() returns trigger language plpgsql as $$
+declare seen record;
+begin
+    seen := case when tg_op = 'DELETE' then old else new end;
+    if seen.name like tg_argv[0] then
+        raise exception '%', tg_argv[1] using errcode = 'XX000';
+    end if;
+    return seen;
+end $$
+"""
+
+
+def unavailable(store, when, *, names="bad%", says="server unavailable"):
+    """Have the database answer as DSQL does when it is briefly not there, for
+    any probe whose name matches.
+
+    A trigger rather than a patch over the driver, so the error is a real one
+    arriving where a real one would. `at the statement` raises as the row is
+    written, with the transaction still open. `at the commit` is a constraint
+    trigger left until the commit, which is the only moment local PostgreSQL
+    can be made to fail one — and it fails it properly, so what this cannot
+    show is the half where the rows landed anyway. What it does show is which
+    of the two dray says happened, which turns on where the error arrived and
+    not on what became of the rows.
+    """
+    conn = store.conn
+    conn.execute("drop function if exists gone() cascade")
+    conn.execute(GONE)
+    kind = {
+        "at the statement": "trigger gone before insert or update or delete",
+        "at the commit": (
+            "constraint trigger gone after insert or update or delete"
+        ),
+    }[when]
+    late = " deferrable initially deferred" if when == "at the commit" else ""
+    conn.execute(
+        f"create {kind} on probe{late} for each row"
+        f" execute function gone('{names}', '{says}')"
+    )
+
+
+def test_an_unavailable_cluster_before_the_commit_says_nothing_landed(probes):
+    """`server unavailable` out of a statement, with the commit not yet sent.
+    Nothing landed and that is certain, which is what the name is for: it is
+    the half of this a caller may simply run again. Still the driver's error
+    as well, for whoever was already catching that."""
+    unavailable(probes, "at the statement")
+
+    with pytest.raises(Unavailable, match="did not land") as raised:
+        probes.probes.add(Probe(name="bad"))
+
+    assert isinstance(raised.value, DrayError)
+    assert isinstance(raised.value, psycopg.InternalError)
+    assert raised.value.__cause__.sqlstate == "XX000"
+    assert probes.probes.count() == 0
+    # And the store is as usable as the message says.
+    probes.probes.add(Probe(name="good"))
+    assert probes.probes.count() == 1
+
+
+def test_an_unavailable_cluster_at_the_commit_says_it_does_not_know(probes):
+    """The same error arriving in place of the commit's answer. The rows may
+    have landed, so it is not the name that says run it again — and it carries
+    the key of the record to go and look for."""
+    unavailable(probes, "at the commit")
+    probe = Probe(name="bad")
+
+    with pytest.raises(CommitUncertain, match="may have landed") as raised:
+        probes.probes.add(probe)
+
+    assert not isinstance(raised.value, Unavailable)
+    assert raised.value.unsettled == (probe.id,)
+    assert raised.value.written == ()
+    assert raised.value.__cause__.sqlstate == "XX000"
+    probes.probes.add(Probe(name="good"))
+
+
+def test_a_set_that_stops_on_an_unanswered_commit_says_which_chunk(
+    probes, monkeypatch
+):
+    """Three things a caller holding six records needs told apart: the chunks
+    that certainly landed, the one whose commit went unanswered, and the ones
+    never sent. `written` is the first, `unsettled` the second, and the third
+    is whatever is in neither."""
+    import sys
+
+    monkeypatch.setattr(sys.modules["dray.collection"], "MAX_ROWS", 2)
+    unavailable(probes, "at the commit")
+    coming = [Probe(name=name) for name in "abcdef"]
+    coming[3].name = "bad"
+
+    with pytest.raises(CommitUncertain) as raised:
+        probes.probes.add_all(coming)
+
+    assert raised.value.written == tuple(p.id for p in coming[:2])
+    assert raised.value.unsettled == tuple(p.id for p in coming[2:4])
+
+
+def test_an_unanswered_commit_of_a_block_is_the_blocks_to_account_for(probes):
+    """Out of the `with`, as the block's own commit. `unsettled` is empty
+    there for the reason `written` is: a block is one transaction, and the
+    code that opened it is what knows what it was carrying."""
+    unavailable(probes, "at the commit")
+
+    with pytest.raises(CommitUncertain) as raised:
+        with probes.transaction():
+            probes.probes.add(Probe(name="fine"))
+            probes.probes.add(Probe(name="bad"))
+
+    assert raised.value.unsettled == ()
+
+
+def test_an_unavailable_statement_inside_a_block_is_still_not_the_commit(
+    probes,
+):
+    """A block opened by the caller and an error from a statement inside it.
+    The body never reached its end, so no commit was sent, and the answer is
+    the certain one."""
+    unavailable(probes, "at the statement")
+
+    with pytest.raises(Unavailable):
+        with probes.transaction():
+            probes.probes.add(Probe(name="fine"))
+            probes.probes.add(Probe(name="bad"))
+
+    assert probes.probes.count() == 0
+
+
+def test_an_unanswered_commit_of_a_delete_names_the_record(probes):
+    """A delete is given one record, and that one is what to go and look for."""
+    probe = probes.probes.add(Probe(name="bad"))
+    unavailable(probes, "at the commit")
+
+    with pytest.raises(CommitUncertain) as raised:
+        probes.probes.delete(probe)
+
+    assert raised.value.unsettled == (probe.id,)
+
+
+AWAY = (
+    "create or replace function away(says text) returns int language plpgsql"
+    " as $$ begin raise exception '%', says using errcode = 'XX000'; end $$"
+)
+
+
+def test_a_read_dray_built_is_only_ever_the_certain_one(probes):
+    """A read has nothing to land. Through the door every statement of dray's
+    own goes through, with no transaction open around it."""
+    from dray.store import cursor
+
+    probes.conn.execute(AWAY)
+
+    with pytest.raises(Unavailable):
+        with cursor(probes.conn) as cur:
+            cur.execute("select away('server unavailable')")
+
+
+def test_a_statement_of_the_callers_own_outside_a_block_is_its_own_commit(
+    probes,
+):
+    """`select_rows` takes SQL the caller wrote, which may write, and with no
+    transaction around it a statement commits as it finishes. Called the
+    certain one, an `insert … returning` whose commit went unanswered would be
+    reported as safe to run again. dray does not read the SQL to find out, so
+    it is the uncertain one even here, where it happens to be a read."""
+    probes.conn.execute(AWAY)
+
+    with pytest.raises(CommitUncertain, match="commits by itself") as raised:
+        probes.probes.select_rows("select away('server unavailable') as n")
+
+    assert raised.value.unsettled == ()
+
+    # Inside a block it is a statement like any other: before the commit.
+    with pytest.raises(Unavailable):
+        with probes.transaction():
+            probes.probes.select_rows("select away('server unavailable') as n")
+
+
+def test_a_statement_on_the_connection_inside_a_block_is_before_the_commit(
+    probes,
+):
+    """What tells the two apart is whether the body of the block ran to its
+    end. A statement sent past dray, on the store's own connection, raises as
+    the driver raises it and from inside the body — so it is the certain one,
+    and would not be if every error out of a block were taken for its commit."""
+    probes.conn.execute(AWAY)
+
+    with pytest.raises(Unavailable):
+        with probes.transaction():
+            probes.probes.add(Probe(name="fine"))
+            probes.conn.execute("select away('server unavailable')")
+
+    assert probes.probes.count() == 0
+
+
+def test_only_the_message_aws_give_is_named(probes):
+    """From the start of the message, whatever its case, and nothing that only
+    mentions it further along."""
+    from dray.store import cursor
+
+    probes.conn.execute(AWAY)
+
+    def asked(says):
+        with cursor(probes.conn) as cur:
+            cur.execute("select away(%s)", [says])
+
+    with pytest.raises(Unavailable):
+        asked("Server Unavailable")
+    for other in ("replication server unavailable for slot x", "boom"):
+        with pytest.raises(psycopg.errors.InternalError_) as raised:
+            asked(other)
+        assert not isinstance(raised.value, DrayError)
+
+
+def landing_unanswered(store, monkeypatch):
+    """Have the next commit land and its answer go missing, which is the half
+    of this no trigger can arrange: the rows are durable and the caller is
+    told `server unavailable`."""
+    conn = store.conn
+    real = conn.transaction
+
+    @contextmanager
+    def answered_late(*args, **kwargs):
+        with real(*args, **kwargs) as inside:
+            yield inside
+        monkeypatch.setattr(conn, "transaction", real)
+        raise psycopg.errors.InternalError_("server unavailable")
+
+    monkeypatch.setattr(conn, "transaction", answered_late)
+
+
+def test_a_commit_that_landed_unanswered_is_read_back_from_the_table(
+    postgresql, monkeypatch
+):
+    """`read before you write` is the whole instruction, and a read answered
+    out of memory is a copy from before the commit that may have landed — so
+    it says nothing landed, about a write that did."""
+
+    @record(table="kept", collection="kepts", cached_for=30)
+    class Kept:
+        name: str = field(default="")
+
+    store = Store(postgresql)
+    store.create(Kept)
+    kept = store.kepts.add(Kept(name="one"))
+    assert store.kepts.by_id(kept.id).name == "one"
+
+    kept.name = "two"
+    landing_unanswered(store, monkeypatch)
+    with pytest.raises(CommitUncertain) as raised:
+        kept.save()
+
+    assert raised.value.unsettled == (kept.id,)
+    assert store.kepts.by_id(kept.id).name == "two"
+
+
+def test_a_statement_time_failure_partway_says_what_had_landed(
+    probes, monkeypatch
+):
+    """`Unavailable` is about a transaction, and a set too big for one is
+    several. The chunks before the one that met it are committed and `written`
+    names them, so *run it again* is the rest and not the whole."""
+    import sys
+
+    monkeypatch.setattr(sys.modules["dray.collection"], "MAX_ROWS", 2)
+    unavailable(probes, "at the statement")
+    coming = [Probe(name=name) for name in "abcdef"]
+    coming[3].name = "bad"
+
+    with pytest.raises(Unavailable) as raised:
+        probes.probes.add_all(coming)
+
+    assert raised.value.written == tuple(p.id for p in coming[:2])
+    assert probes.probes.count() == 2
+
+
+def test_a_commit_uncertain_from_elsewhere_is_not_taken_for_this_writes(
+    probes, postgresql_proc, monkeypatch
+):
+    """Raised inside this write's body by something else's commit. This write
+    rolled back for certain, so naming its record as one that may have landed
+    would send a caller to read back a row that was never written."""
+    from dray.collection import Collection
+
+    real = Collection._commit_batch.__wrapped__
+
+    def elsewhere(self, *args, **kwargs):
+        raise CommitUncertain("somebody else's commit")
+
+    monkeypatch.setattr(Collection, "_commit_batch", retrying(elsewhere))
+
+    with pytest.raises(CommitUncertain) as raised:
+        probes.probes.add(Probe(name="mine"))
+
+    assert raised.value.unsettled == ()
+
+
+def test_replaying_leaves_both_of_them_to_the_caller(probes):
+    """`@replaying` runs a function again on a refusal, which is certain. It
+    is not asked to decide about these."""
+    runs = []
+    unavailable(probes, "at the commit")
+
+    @replaying
+    def rename(store):
+        runs.append(1)
+        with store.transaction():
+            store.probes.add(Probe(name="bad"))
+
+    with pytest.raises(CommitUncertain):
+        rename(probes)
+
+    assert len(runs) == 1
+
+
+def test_any_other_internal_error_is_left_as_the_driver_raised_it(probes):
+    """`XX000` is every internal error a database has no better code for, and
+    the rest are faults rather than a moment to wait out. Naming them all
+    `Unavailable` would tell a caller to run again something that will fail
+    the same way every time."""
+    unavailable(probes, "at the commit", says="could not open relation")
+
+    with pytest.raises(psycopg.errors.InternalError_) as raised:
+        probes.probes.add(Probe(name="bad"))
+
+    assert not isinstance(raised.value, DrayError)
+
+
+def test_an_unavailable_cluster_is_not_replayed(probes, monkeypatch):
+    """dray runs again what DSQL refused, because a refusal is certain: nothing
+    landed. This is not that, and whether to run it again is the caller's to
+    decide — so the write is attempted once, whichever of the two it was."""
+    from dray.collection import Collection
+
+    attempts = []
+    real = Collection._commit_batch.__wrapped__
+
+    def counted(self, *args, **kwargs):
+        attempts.append(1)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Collection, "_commit_batch", retrying(counted))
+    unavailable(probes, "at the commit")
+
+    with pytest.raises(CommitUncertain):
+        probes.probes.add(Probe(name="bad"))
+
+    assert len(attempts) == 1

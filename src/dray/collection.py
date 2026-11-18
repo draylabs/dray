@@ -50,6 +50,7 @@ from dray.model import (
     normalised,
 )
 from dray.store import (
+    CommitUncertain,
     DuplicateRecord,
     RecordHasChanged,
     RecordNotFound,
@@ -57,6 +58,19 @@ from dray.store import (
     cursor,
     retrying,
 )
+
+
+def _ours(failed: BaseException, store: Any) -> bool:
+    """Whether what a write raised is its own commit going unanswered.
+
+    Its own, and the outermost: one raised by another store inside this write,
+    or by the commit of a block this write only joined, says nothing about
+    which of these records landed."""
+    return (
+        isinstance(failed, CommitUncertain)
+        and getattr(failed, "_store", None) is store
+        and not failed.unsettled
+    )
 
 
 def _as_param(value: Any) -> Any:
@@ -255,7 +269,8 @@ class Collection:
         # number on the other side of its own fetch.
         dropped = 0 if cache is None else cache.evictions()
         with cursor(
-            self.conn, rows=dict_row, watch=self._watch, cls=self.cls
+            self.conn, rows=dict_row, watch=self._watch, cls=self.cls,
+            theirs=True,
         ) as cur:
             cur.execute(statement, list(params))
             _check_select(self.cls, cur.description)
@@ -332,7 +347,8 @@ class Collection:
         # row and then saving its defaults over the rest, which cannot happen
         # where nothing is hydrated.
         with cursor(
-            self.conn, rows=dict_row, watch=self._watch, cls=self.cls
+            self.conn, rows=dict_row, watch=self._watch, cls=self.cls,
+            theirs=True,
         ) as cur:
             cur.execute(statement, list(params))
             return cur.fetchall()
@@ -1349,7 +1365,12 @@ class Collection:
         asks by identity, as `by_id` and a save do, so removing the same record
         twice is a broken assumption rather than a second success. The handler
         has already run and whatever it wrote goes back with the raise."""
-        self._delete_batch(record)
+        try:
+            self._delete_batch(record)
+        except CommitUncertain as unsure:
+            if _ours(unsure, self.store):
+                unsure.unsettled = (key_of(record),)
+            raise
         self._forget_removed([key_of(record)])
 
     #
@@ -1590,6 +1611,13 @@ class Collection:
                 # whichever of them arrived.
                 if durable:
                     failed.written = tuple(written)
+                    # And the chunk that raised, where what it raised was a
+                    # commit that went unanswered. Those are the records to
+                    # read back; the ones after it were never sent.
+                    if _ours(failed, self.store):
+                        failed.unsettled = tuple(
+                            key_of(record) for record, *_ in prepared
+                        )
                     # The rows the chunks before this one wrote are durable, so
                     # the cache is now wrong about every one of them — and the
                     # raise goes straight past the eviction at the foot of this

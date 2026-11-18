@@ -3200,11 +3200,12 @@ a transaction of its own and is not covered by the one that just committed.
 of each other — three cancellations are three guests — so all of them run and
 then `AfterCommitFailed` is raised, carrying every failure in `.failures`.
 
-That one is worth catching by name. Everything else out of a
+That one is worth catching by name. Nearly everything else out of a
 `with store.transaction()` means the work did not land, so a caller who catches
-broadly and treats failure as "it did not happen" is right about all of them and
+broadly and treats failure as "it did not happen" is right about those and
 wrong about this one: the rows are committed, and running the work again writes
-it twice.
+it twice. `CommitUncertain` is the other that is not a plain no, and *When DSQL
+is briefly not there* is where it is.
 
 The placement that is always wrong is inside the write itself, in an `on_save`
 handler. dray replays a write DSQL refuses, so the job would be queued once per
@@ -4143,7 +4144,7 @@ as refuse.
 
 ## When it goes wrong
 
-dray raises eight things, and they are the ones you can write an `except` for
+dray raises ten things, and they are the ones you can write an `except` for
 without knowing which database is underneath. **Every one of them is a
 `DrayError`**, so a request handler that turns any refusal into a 400, or a job
 that logs and moves on, catches the one name rather than listing them — and
@@ -4159,7 +4160,8 @@ except dray.DrayError as refused:
 Each keeps a builtin base as well, so code that handles a bad value or a dead
 connection generally still catches them without knowing dray is underneath:
 `ValidationError` and `DuplicateRecord` are `ValueError`s, `RecordNotFound` is
-a `LookupError`, and `ConnectionLost` is a `psycopg.OperationalError`.
+a `LookupError`, `ConnectionLost` is a `psycopg.OperationalError`, and
+`Unavailable` and `CommitUncertain` are `psycopg.InternalError`s.
 
 **Which is what puts an order on a ladder of them.** `except` clauses are tried
 as they are written and the first that matches wins, so a general one above a
@@ -4176,7 +4178,7 @@ is the ordinary one — the particular before the general — and it is worth
 saying here only because these bases are dray's doing rather than yours: the
 ladder that goes wrong is one written entirely out of dray's own names, by
 somebody who read the paragraph above and took it as an unmixed kindness.
-`dray.DrayError` catches all eight and belongs at the bottom for the same
+`dray.DrayError` catches all ten and belongs at the bottom for the same
 reason.
 
 
@@ -4190,6 +4192,8 @@ reason.
 | `AfterCommitFailed` | the rows committed and an `after_commit` handler then raised |
 | `ConcurrencyExhausted` | DSQL refused the same write five times running over its rows or twenty over the schema, or a `@replaying` function as many times as it was given or twenty over the schema |
 | `ConnectionLost` | the connection was closed underneath the store — see *Connections* |
+| `Unavailable` | DSQL was briefly not there, before anything was committed. Nothing landed |
+| `CommitUncertain` | DSQL was briefly not there while committing. The rows may have landed |
 
 Everything else is the database's, and arrives as `psycopg` raised it: a check
 constraint you added in a migration, a column that does not exist, a syntax
@@ -4278,6 +4282,83 @@ count you give it a number to choose against a timeout somebody is waiting on.
 Its waits climb no higher than 400 ms however many attempts you ask for, so
 twenty of them is at most eight seconds of waiting and not the hours a doubling
 without a ceiling would be.
+
+### When DSQL is briefly not there
+
+A cluster can answer any statement with `server unavailable`. It is a passing
+condition, the connection is still good, and AWS's advice is to run the whole
+transaction again. dray runs nothing again here, because the one thing that
+decides whether that is safe is a thing only you can settle — so it tells you
+which of two things happened, under two names.
+
+**`Unavailable` is the error arriving before a commit was sent.** A read, or a
+statement inside a write. The transaction that met it did not land, and that
+is certain: run the work again.
+
+**`CommitUncertain` is the error arriving in place of a commit's answer.** The
+commit was sent and nothing came back to say how it went. It may have landed
+and it may not, and nobody on your side of the connection knows.
+
+```python
+try:
+    store.people.add(person)
+except dray.Unavailable:
+    ...                       # that transaction did not land — run it again
+except dray.CommitUncertain as unsure:
+    unsure.unsettled          # keys of the records that may have landed
+```
+
+They are two names rather than one because they call for different things, and
+the second is the one that is easy to get wrong. Run a write again that had in
+fact landed and what comes back blames somebody else: an `add` is refused as a
+`DuplicateRecord` over a record that is yours, a guarded `save` raises
+`RecordHasChanged` about a change you made, and an unguarded one lands a second
+time and writes whatever it logs twice.
+
+So after a `CommitUncertain`, **read before you write, and go on from what you
+read.** `by_id` on each key in `unsettled` says whether an `add` landed, by
+finding the record or raising `RecordNotFound`, and for a `save` what it hands
+back either holds what you set or does not. dray empties its read cache when
+it raises this, so that read is the table's answer and not a copy from before.
+
+The record in your hand is not the thing to ask or to carry on with. It is as
+it was before the write, whichever way the write went: the etag it arrived
+with, and any children you queued on it still queued. If the write landed,
+those children are in the table already and saving that record again writes
+them a second time.
+
+**`Unavailable` means the transaction, not the call.** Two places that
+matters. A set too big for one transaction can have landed its first chunks
+before a later one met the error, and `written` holds those as it does for any
+failure partway — what there is to run again is the rest. And inside a
+`store.transaction()` you opened, the transaction is your block. The database
+has stopped taking statements in it, so catching the error and carrying on
+inside the `with` commits nothing; the thing to run again is the block.
+
+**A statement of your own, run outside any block, is its own commit.**
+`select_rows` and `select_many` take SQL you wrote, which may write, and with
+no transaction around it a statement commits as it finishes. So there the
+answer is `CommitUncertain` and never `Unavailable`, even where the statement
+was a read and you know nothing could have landed — dray does not read your
+SQL to find out. `store.create` is the same. Inside a block, a statement of
+yours is like any other statement: before the commit.
+
+`unsettled` is the mirror of `written` above. A set too big for one
+transaction that stops on an unanswered commit has `written` holding the
+chunks that certainly landed and `unsettled` holding the one that went
+unanswered; the records in neither were never sent. It names the records an
+`add`, a `save`, their bulk forms or a `delete` was given, and not their
+children, which went with them or did not. It is empty everywhere else: out
+of a `store.transaction()` you opened, where the block is what knows what it
+held, for a statement of your own, and for a write made on a child set.
+
+Neither is one for a 400. Both are `DrayError`s, so the handler at the top of
+this section catches them with the rest — and what they mean is *try again in
+a moment*, which is a 503 if it is anything.
+
+**Only that one message.** `server unavailable` shares its code, `XX000`, with
+every other internal error a database can raise, and those are not passing
+conditions. Anything else under that code reaches you as the driver raised it.
 
 ## Tables
 

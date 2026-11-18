@@ -8972,7 +8972,7 @@ def test_everything_dray_raises_is_a_dray_error(store):
         and thing is not DrayError  # the base is not one of the things raised
     ]
 
-    assert len(raised) == 8, "a new one arrived; it wants a row on the page too"
+    assert len(raised) == 10, "a new one arrived; it wants a row on the page too"
     assert [c for c in raised if not issubclass(c, DrayError)] == []
 
 
@@ -8984,6 +8984,10 @@ def test_a_dray_error_is_still_what_it_always_was(store):
     assert issubclass(RecordNotFound, LookupError)
     assert issubclass(DuplicateRecord, ValueError)
     assert issubclass(ConnectionLost, psycopg.OperationalError)
+    from dray import CommitUncertain, Unavailable
+
+    assert issubclass(Unavailable, psycopg.InternalError)
+    assert issubclass(CommitUncertain, psycopg.InternalError)
 
 
 def test_a_clash_names_the_columns_and_not_the_key_it_just_minted(store):
