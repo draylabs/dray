@@ -54,14 +54,19 @@ With dray you get:
 
 - **DSQL's limits handled for you.** A transaction there holds 3,000 rows, so a
   big write is split to fit; a commit it refuses under contention is replayed
-  rather than raised at you; and a delete reaches the records underneath.
+  rather than raised at you; a save that meets somebody's migration rides it
+  out; and a delete reaches the records underneath.
 - **Records that are plain dataclasses**, declared with a decorator. No base
   class, no metaclass, and no connection — you can build one, hand it to a
   function and test it with the database nowhere in sight.
 - **A column or a JSON document, decided per field.** Give a field its own
   column, or keep it in a `jsonb` document beside the others — adding one of
-  those is a write rather than a migration, and a filter is written the same
-  way either side.
+  those is a write rather than a migration, and a filter and an index are
+  written the same way either side.
+- **Indexes said on the class, down to which rows.** `index("family_name",
+  where={"status": "volunteer"})` covers the few anybody asks about, and with
+  `unique=True` it is a rule about those alone: one open signup per person,
+  any number of cancelled ones.
 - **Somewhere for your queries to live.** A collection is a class you own, with
   `find` for matching on values and SQL you wrote for everything else. Both
   hand back records rather than rows.
@@ -92,6 +97,10 @@ With dray you get:
   quietly painting over it. Every record carries an `etag` dray mints and
   checks on the way back in, so you get a `RecordHasChanged` to handle rather
   than a mystery change to account for weeks later.
+- **Two answers when DSQL is briefly not there, rather than one error.**
+  `Unavailable` where nothing was committed and the work can be run again,
+  and `CommitUncertain` where the commit went unanswered and the rows may have
+  landed — with the keys of the records to go and look for.
 - **The `create table` your classes imply**, as statements to paste into a
   migration — and a way to ask a live database where it has drifted from
   them.
