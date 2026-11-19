@@ -1,0 +1,176 @@
+name: release
+
+# A release is a tag. `pyproject.toml` is bumped and committed on `main` like any
+# other change, and pushing `v` plus that number is what asks for the upload.
+#
+# Publishing is the one thing here that cannot be taken back: a version burns on
+# upload, and can be yanked and never replaced. So every check that could refuse
+# a release runs before the job that makes one, and that job waits for a person.
+on:
+  push:
+    tags: ["v*"]
+
+# Nothing below may write to the repository or ask for an identity unless its
+# own job says so.
+permissions:
+  contents: read
+
+jobs:
+  # The suite against exactly the commit that was tagged, on every Python the
+  # metadata names. Not the run `main` had when the commit landed: that one
+  # answered for the tree as it was pushed, and this asks about the tag.
+  suite:
+    uses: ./.github/workflows/test.yml
+
+  build:
+    runs-on: ubuntu-latest
+    name: build and check
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      # The whole history, because whether the tag is on `main` is a question
+      # about ancestry and a shallow clone cannot answer it.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v10.0.0
+        with:
+          python-version: "3.12"
+
+      # The version lives in `pyproject.toml` and nowhere else, so the tag is a
+      # second statement of it and the two can disagree. Refusing here is what
+      # stops `v0.3` being pushed at a tree that still says `0.2`.
+      - name: The tag and the tree name the same version
+        id: version
+        run: |
+          version=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "The tag is $GITHUB_REF_NAME and pyproject.toml says $version." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # A tag can be pushed at any commit. What is released is what `main` holds,
+      # so a tag on a branch nobody merged is refused.
+      - name: The tagged commit is on main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "$GITHUB_REF_NAME is not on main." >&2
+            exit 1
+          fi
+
+      # PyPI would refuse the upload anyway. Asking first says why, and says it
+      # before a person is asked to approve a release that cannot happen.
+      - name: The version is not already on PyPI
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          status=$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/dray/$VERSION/json")
+          case "$status" in
+            404) echo "dray $VERSION is not on PyPI." ;;
+            200) echo "dray $VERSION is already on PyPI, and a version is never replaced." >&2; exit 1 ;;
+            *)   echo "PyPI answered $status, which says nothing either way." >&2; exit 1 ;;
+          esac
+
+      - name: Build the wheel and the source archive
+        run: uv build
+
+      # `twine check` renders the README with the library PyPI renders it with,
+      # so a long description that will not display is found here rather than
+      # on the project's page.
+      - name: Check the metadata
+        run: uvx twine check --strict dist/*
+
+      # These are held out of the repository by a file git does not carry, so a
+      # checkout here has none of them and this cannot fail today. It is here
+      # for the day one is committed by mistake: the build backend leaves them
+      # out by default rather than by instruction, and an archive on PyPI stays
+      # downloadable after it is yanked.
+      - name: Nothing travels that should not
+        run: |
+          { tar -tzf dist/*.tar.gz; unzip -Z1 dist/*.whl; } > contents.txt
+          if grep -E '(^|/)(wip|prompts|notes|scratch|\.claude)/|(^|/)CLAUDE\.md$' contents.txt; then
+            echo "The artifacts carry the files above." >&2
+            exit 1
+          fi
+
+      # The suite runs against the source tree, so a wheel that leaves a module
+      # out, or cannot be imported at all, passes it. Installed somewhere that
+      # has never seen the tree and run from a directory that is not the tree,
+      # with the extra, since `dray.Pool` is half of what is being shipped.
+      - name: Install the wheel somewhere clean and import it
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          wheel=$(ls "$PWD"/dist/*.whl)
+          clean=$(mktemp -d)
+          cd "$clean"
+          uv venv --python 3.12 venv
+          uv pip install --python venv/bin/python "dray[dsql] @ file://$wheel"
+          venv/bin/python - <<'PY'
+          import os
+          import dray
+
+          assert dray.__version__ == os.environ["VERSION"], dray.__version__
+          dray.Pool, dray.Store, dray.record
+          print("dray", dray.__version__, "imports from the wheel")
+          PY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  # The upload. PyPI trusts this workflow file in this repository running in
+  # this environment, and nothing else, so there is no token to store, rotate
+  # or leak. The environment is where the waiting happens: it names who has to
+  # approve, and the job does not start until they have.
+  publish:
+    needs: [suite, build]
+    runs-on: ubuntu-latest
+    name: publish to PyPI
+    environment:
+      name: pypi
+      url: https://pypi.org/project/dray/${{ needs.build.outputs.version }}/
+    permissions:
+      # What lets the job prove to PyPI which workflow it is. No other job has
+      # it, so no other job can upload.
+      id-token: write
+
+    steps:
+      # The files the checks above passed, not a second build that nothing
+      # looked at.
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # Bookkeeping that follows the upload, and only if there was one.
+  notes:
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    name: GitHub release
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Write the release down
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "dray $VERSION" \
+            --generate-notes

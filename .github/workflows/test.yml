@@ -6,6 +6,8 @@ on:
   pull_request:
   push:
     branches: [main]
+  # And from `release`, which runs all of this against a tag before it uploads.
+  workflow_call:
 
 # A second push to a branch makes the first run's answer worthless.
 concurrency:
