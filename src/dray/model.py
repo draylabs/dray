@@ -15,6 +15,13 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import MISSING
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+from ipaddress import (
+    IPv4Address,
+    IPv4Interface,
+    IPv6Address,
+    IPv6Interface,
+    ip_address,
+)
 from typing import TYPE_CHECKING, Any, TypeVar, dataclass_transform
 
 from uuid import UUID, uuid4
@@ -682,9 +689,9 @@ def index(
         index("email", unique=True, where=Sql("email is not null"))
 
     A field stored in the blob is named like any other, in the columns or in a
-    `where=` mapping, where it is a `str`, an `int`, a `bool`, a `date` or a
-    `UUID`. The index is over its text, which those five have one of, and
-    `find` asks in the way that reaches it. An index naming one is never a
+    `where=` mapping, where it is a `str`, an `int`, a `bool`, a `date`, a
+    `UUID` or an IP address. The index is over its text, which those six have
+    one of, and `find` asks in the way that reaches it. An index naming one is never a
     constraint in the `create table` either.
 
     A mapping is fields and the values they hold, every pair of which has to
@@ -1228,12 +1235,22 @@ def field(
     return dataclasses.field(default=default, metadata=metadata)
 
 
+# An address of either family. `inet` holds both in one column and Python has
+# no one class for the pair, so this union is how a field says it will take
+# whichever arrives — and the one union that is a kind of value in its own
+# right rather than a choice between two.
+ADDRESS = IPv4Address | IPv6Address
+
+
 def base_type(annotation: Any) -> Any:
-    """`str | None` is a `str` as far as anything downstream is concerned."""
+    """`str | None` is a `str` as far as anything downstream is concerned, and
+    the two families of address in either order are `ADDRESS`."""
     if typing.get_origin(annotation) in (types.UnionType, typing.Union):
         rest = [a for a in typing.get_args(annotation) if a is not type(None)]
         if len(rest) == 1:
             return rest[0]
+        if set(rest) == {IPv4Address, IPv6Address}:
+            return ADDRESS
     return annotation
 
 
@@ -1262,8 +1279,19 @@ UNINDEXABLE: dict[Any, str] = {
 # kind of value with one text and no more: `4.5` and `4.50` are a single
 # `Decimal` and two strings, a `datetime` is one moment in as many spellings as
 # there are time zones, and a `float` is `1` or `1.0` by the writer's taste.
-# These five are written one way by `json.dumps` and `as_text` both.
-BLOB_INDEXABLE = (str, int, bool, date, UUID)
+# These are written one way by `json.dumps` and `as_text` both. An address is
+# among them because `str` writes each in its one shortest form, which is the
+# text `host()` gives for it on either database.
+BLOB_INDEXABLE = (
+    str,
+    int,
+    bool,
+    date,
+    UUID,
+    IPv4Address,
+    IPv6Address,
+    ADDRESS,
+)
 
 
 def check_indexable(owner: str, name: str, annotation: Any) -> None:
@@ -1326,7 +1354,8 @@ def check_blob_indexable(owner: str, name: str, annotation: Any) -> None:
     raise ValueError(
         f"{owner}.{name} is declared {said} and stored in the blob, and an "
         "index over a field there is over its text — which serves str, int, "
-        f"bool, date and UUID, each written one way only. {instead}"
+        "bool, date, UUID and an IP address, each written one way only. "
+        f"{instead}"
     )
 
 
@@ -1404,6 +1433,9 @@ FROM_TEXT: dict[Any, Callable[[str], Any]] = {
     UUID: UUID,
     bytes: bytes.fromhex,
     timedelta: lambda text: timedelta(seconds=float(text)),
+    IPv4Address: IPv4Address,
+    IPv6Address: IPv6Address,
+    ADDRESS: ip_address,
 }
 
 
@@ -1420,7 +1452,22 @@ def as_text(value: Any) -> str:
         return value.hex()
     if isinstance(value, (Decimal, UUID)):
         return str(value)
+    if isinstance(value, (IPv4Address, IPv6Address)):
+        return address_text(value)
     raise TypeError(f"{type(value).__name__} cannot be stored in the blob")
+
+
+def address_text(value: IPv4Address | IPv6Address) -> str:
+    """
+    An address as the document holds it, which is as `inet` would give it back.
+
+    That is `str`, less one thing: a link-local address can carry the name of
+    the interface it was heard on, `fe80::1%eth0`, and `inet` has nowhere to
+    put one. A column drops it on the way in, so the document does too — or a
+    field would hold one value in a column and another in the blob, and the
+    text an index is built over would be text no cast to `inet` accepts.
+    """
+    return str(value).partition("%")[0]
 
 
 def restorer(annotation: Any) -> Callable[[str], Any] | None:
@@ -1446,6 +1493,9 @@ def restore(value: Any, rules: Mapping[str, Any]) -> Any:
         return parse(value)
     except (ValueError, TypeError):
         return value
+
+
+INTERFACES = (IPv4Interface, IPv6Interface)
 
 
 def accepts(annotation: Any) -> tuple[type, ...] | None:
@@ -1478,9 +1528,14 @@ def accepts(annotation: Any) -> tuple[type, ...] | None:
 
 
 def fits(value: Any, allowed: tuple[type, ...]) -> bool:
-    """`isinstance`, with the one correction it needs: `bool` is a subclass of
-    `int`, so `True` would otherwise pass for a count of one."""
+    """`isinstance`, with the two corrections it needs. `bool` is a subclass of
+    `int`, so `True` would otherwise pass for a count of one. And an interface
+    is a subclass of an address, so `10.0.0.9/24` would otherwise pass for
+    `10.0.0.9` — which `inet` stores mask and all, hands back as an interface,
+    and compares as a different value from the address alone."""
     if isinstance(value, bool) and bool not in allowed:
+        return False
+    if isinstance(value, INTERFACES) and type(value) not in allowed:
         return False
     return isinstance(value, allowed)
 
@@ -1793,6 +1848,8 @@ def indexed_text(value: Any) -> str | None:
         return value.isoformat()
     if kind in (str, int, UUID):
         return str(value)
+    if kind in (IPv4Address, IPv6Address):
+        return address_text(value)
     return None
 
 

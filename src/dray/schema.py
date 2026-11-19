@@ -11,10 +11,12 @@ import hashlib
 from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+from ipaddress import IPv4Address, IPv6Address
 from uuid import UUID
 from typing import Any
 
 from dray.model import (
+    ADDRESS,
     Index,
     Sql,
     _nulls,
@@ -56,6 +58,9 @@ SQL_TYPES: dict[Any, str] = {
     bytes: "bytea",
     dict: "jsonb",
     list: "jsonb",
+    IPv4Address: "inet",
+    IPv6Address: "inet",
+    ADDRESS: "inet",
 }
 
 

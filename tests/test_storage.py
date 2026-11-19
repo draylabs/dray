@@ -6779,6 +6779,182 @@ def test_every_type_dray_knows_survives_both_sides(store):
     )
 
 
+def test_an_address_is_an_inet_column_and_comes_back_as_one(store):
+    """Either family, or a field that takes whichever arrives, in a column or
+    in the blob. Left to fall through to `text`, a column held `10.0.0.9/32`
+    and handed back a string, and the blob refused the write."""
+    from ipaddress import IPv4Address, IPv6Address, ip_address
+
+    four, six = ip_address("10.0.0.9"), ip_address("2001:db8::5")
+
+    @record(table="host", collection="hosts")
+    class Host:
+        name: str = field(default="")
+        v4: IPv4Address | None = field(default=None)
+        v6: IPv6Address | None = field(default=None)
+        either: IPv4Address | IPv6Address | None = field(default=None)
+        v4_blob: IPv4Address | None = field(default=None, stored_in="blob")
+        v6_blob: IPv6Address | None = field(default=None, stored_in="blob")
+        either_blob: IPv6Address | IPv4Address | None = field(
+            default=None, stored_in="blob"
+        )
+
+    ddl = schema.create_table(Host)
+    assert "v4 inet" in ddl and "v6 inet" in ddl and "either inet" in ddl
+
+    store.create(Host)
+    a = store.hosts.add(
+        Host(name="a", v4=four, v6=six, either=four,
+             v4_blob=four, v6_blob=six, either_blob=four)
+    )
+    store.hosts.add(Host(name="b", either=six, either_blob=six))
+
+    back = store.hosts.by_id(a.id)
+    assert back.v4 == back.v4_blob == back.either == back.either_blob == four
+    assert back.v6 == back.v6_blob == six
+    assert type(back.v4) is type(back.v4_blob) is IPv4Address
+    assert type(back.either) is type(back.either_blob) is IPv4Address
+    assert type(back.v6) is type(back.v6_blob) is IPv6Address
+
+    # The document holds each as its text, with no mask on the end of it.
+    held = store.conn.execute(
+        "select data->>'v4_blob', data->>'either_blob' from host order by name"
+    ).fetchall()
+    assert held == [("10.0.0.9", "10.0.0.9"), (None, "2001:db8::5")]
+
+    def named(**question):
+        return sorted(r.name for r in store.hosts.find(**question))
+
+    assert named(equals={"either": six}) == ["b"]
+    assert named(equals={"either_blob": six}) == ["b"]
+    assert named(equals={"either": any_of(four, six)}) == ["a", "b"]
+    assert named(equals={"either_blob": any_of(four, six)}) == ["a", "b"]
+    assert named(equals={"either": none_of(four)}) == ["b"]
+    # Sorted as addresses and not as their text, every v4 ahead of any v6.
+    assert [r.name for r in store.hosts.find(order_by="either")] == ["a", "b"]
+
+    # And what a `text` column could not answer: which of them are in a subnet.
+    assert [
+        r.name for r in store.hosts.select_many(
+            f"select {store.hosts.columns} from host where either << %s",
+            ["10.0.0.0/24"],
+        )
+    ] == ["a"]
+
+
+def test_the_two_families_are_one_kind_of_value_however_they_are_written():
+    """`inet` holds both, and Python has no class for the pair, so the union
+    is how a field says it. In either order and in either spelling — and only
+    that pair: an address beside anything else is still nothing dray knows."""
+    import typing
+    from ipaddress import IPv4Address, IPv6Address
+
+    for annotation in (
+        IPv4Address | IPv6Address,
+        IPv6Address | IPv4Address | None,
+        typing.Union[IPv4Address, IPv6Address],
+        typing.Optional[typing.Union[IPv6Address, IPv4Address]],
+    ):
+        assert schema._sql_type(annotation) == "inet"
+
+    assert schema._sql_type(IPv4Address | str) == "text"
+
+
+def test_an_address_field_handed_text_takes_it_through_a_converter(store):
+    """Everything downstream of a request is text, and `ip_address` is the
+    standard library's own answer to which family a string is."""
+    from ipaddress import IPv4Address, IPv6Address, ip_address
+
+    @record(table="host", collection="hosts")
+    class Host:
+        address: IPv4Address | IPv6Address | None = field(
+            default=None, converter=ip_address
+        )
+
+    store.create(Host)
+    four = store.hosts.add(Host(address="10.0.0.9"))
+    six = store.hosts.add(Host(address="2001:db8::5"))
+    assert type(four.address) is IPv4Address
+    assert type(six.address) is IPv6Address
+    assert store.hosts.find(equals={"address": "2001:db8::5"}) == [six]
+    assert store.hosts.select_many(
+        f"select {store.hosts.columns} from host where address << '10.0.0.0/24'"
+    ) == [four]
+
+
+def test_an_interface_is_not_an_address(store):
+    """`IPv4Interface` is a subclass of `IPv4Address`, so `isinstance` lets
+    `10.0.0.9/24` through. `inet` then stores the mask, hands back an
+    interface, and holds it to be a different value from `10.0.0.9` — so two
+    rows share an address under an index that says no two can."""
+    from ipaddress import IPv4Address, IPv6Address, ip_interface
+
+    @record(table="host", collection="hosts")
+    class Host:
+        v4: IPv4Address | None = field(default=None)
+        either: IPv4Address | IPv6Address | None = field(default=None)
+        seen: IPv4Address | None = field(default=None, stored_in="blob")
+
+    store.create(Host)
+    for name in ("v4", "either", "seen"):
+        with pytest.raises(ValidationError, match=f"{name}: expected IPv4Address"):
+            store.hosts.add(Host(**{name: ip_interface("10.0.0.9/24")}))
+    with pytest.raises(ValidationError, match="either: expected"):
+        store.hosts.add(Host(either=ip_interface("2001:db8::5/64")))
+    assert store.hosts.find() == []
+
+
+def test_an_address_in_the_blob_is_reached_by_its_text(store):
+    """An index over a blob field is over its text, and an address has one:
+    the shortest form, which is what `str` writes and what the filter sends."""
+    from ipaddress import IPv4Address, IPv6Address, ip_address
+
+    @record(table="host", collection="hosts", indexes=[index("seen")])
+    class Host:
+        name: str = field(default="")
+        seen: IPv4Address | IPv6Address | None = field(
+            default=None, stored_in="blob"
+        )
+
+    store.create(Host)
+    store.hosts.add(Host(name="a", seen=ip_address("2001:DB8:0:0:0:0:0:5")))
+
+    with store.watching() as watched:
+        found = store.hosts.find(equals={"seen": ip_address("2001:db8::5")})
+    (statement,) = [span.sql for span in watched if span.kind == "statement"
+                    and span.phase == "close"]
+    assert "data->>'seen' = %s and data->'seen' = %s" in statement
+    assert [r.name for r in found] == ["a"]
+
+    # Which is the text a promotion casts, so the column it makes agrees.
+    assert store.conn.execute(
+        "select (data->>'seen')::inet = %s from host",
+        [ip_address("2001:db8::5")],
+    ).fetchone()[0]
+
+
+def test_an_address_loses_the_interface_it_was_heard_on(store):
+    """`fe80::1%eth0` names an interface as well as an address, and `inet` has
+    nowhere to keep one. A column drops it, so the document does too: the
+    field holds the same value on either side, and the record in hand keeps
+    what it was given until it is read again."""
+    from ipaddress import IPv6Address, ip_address
+
+    @record(table="host", collection="hosts", indexes=[index("seen")])
+    class Host:
+        heard: IPv6Address | None = field(default=None)
+        seen: IPv6Address | None = field(default=None, stored_in="blob")
+
+    scoped = ip_address("fe80::1%eth0")
+    store.create(Host)
+    written = store.hosts.add(Host(heard=scoped, seen=scoped))
+    assert written.heard == scoped
+
+    back = store.hosts.by_id(written.id)
+    assert back.heard == back.seen == ip_address("fe80::1")
+    assert store.hosts.find(equals={"seen": scoped}) == [back]
+
+
 def test_a_list_or_dict_column_is_usable(store):
     """`SQL_TYPES` maps both to jsonb, so the DDL was right and the write was
     not: psycopg sends a list as a Postgres array and cannot adapt a dict."""
@@ -7844,8 +8020,8 @@ def test_a_value_with_no_text_to_rely_on_is_asked_about_one_way(store):
 
 def test_a_predicate_may_want_any_blob_field_absent():
     """`is null` is true or false of any kind of value and has no text to get
-    right, so the five kinds are a rule about a value being compared and not
-    about a field being named."""
+    right, so the kinds an index serves are a rule about a value being
+    compared and not about a field being named."""
 
     @record(table="lodge", collection="lodges",
             indexes=[index("name", where={"photo": None})])

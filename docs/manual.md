@@ -1757,6 +1757,7 @@ Which is the whole of the difference:
 | `timedelta` | `interval` | **no** | yes | `string`, seconds | **no** |
 | `Decimal` | `numeric(18,6)` | yes | yes | `string` | **no** |
 | `UUID` | `uuid` | yes | yes | `string` | yes |
+| `IPv4Address`, `IPv6Address` | `inet` | yes | yes | `string` | yes |
 | `bytes` | `bytea` | **no** | yes | `string`, hex | **no** |
 
 The storage and the indexing are DSQL's rather than dray's, from [supported
@@ -1824,6 +1825,25 @@ of that name. `from datetime import time` gives the type; a bare `import time`
 gives the module, and a field annotated with that becomes a `text` column
 without a word said.
 
+`IPv4Address` and `IPv6Address` are the two out of `ipaddress`, and a field
+that takes whichever arrives says both:
+
+```python
+@record(table="host", collection="hosts")
+class Host:
+    address: IPv4Address | IPv6Address | None = field(
+        default=None, converter=ip_address
+    )
+```
+
+All three are one kind of column, because `inet` holds either family. So the
+annotation is what dray holds a value to and not what the database does: SQL
+of your own can put a v6 address in a column the class calls `IPv4Address`,
+and it comes back as what it is. `ip_address`, from the same module, is the
+converter for a field handed text. What the column buys over text is the
+database knowing it is an address — sorted as one, and asked `address <<
+'10.0.0.0/24'` in a statement of your own.
+
 Note how much of that right-hand column says `string`. In the stored document a
 date, a decimal and a piece of text are the same thing, so what brings one back
 is the annotation and not the value — a `str` field holding `"2026-03-14"` stays
@@ -1865,7 +1885,7 @@ What each costs and buys:
 |---|---|---|
 | adding the field | a change to the table, and on a cluster a transaction open across one can have its commit refused and be run again | a write, and nothing about the table changes |
 | `find` by a value | yes | yes |
-| an index | every kind of value but the three above | `str`, `int`, `bool`, `date`, `UUID` |
+| an index | every kind of value but the three above | `str`, `int`, `bool`, `date`, `UUID`, an address |
 | `order_by` | yes | no |
 | a range or a total, in SQL of your own | compared as its own type | read out as text, and cast by you |
 | `unique=True` | holds from the moment the table exists | holds once its index has built |
@@ -1892,6 +1912,18 @@ a field out of the blob*. dray writes nothing to move one back.
 no error and `drift` will not see it, because drift compares names and not
 types. The list above is the whole of what is known; anything else is stored as
 its string and comes back as one.
+
+**An address with a mask on it is not an address.** Python counts an
+`IPv4Interface` as an `IPv4Address`, and `inet` does not count `10.0.0.9/24`
+as `10.0.0.9`: it stores the mask, hands back an interface, and holds the two
+to be different values, so a unique index would take both. A field declared
+as an address refuses one. An interface or a network as an annotation of its
+own is one dray does not know.
+
+**A link-local address loses the interface it was heard on.** `fe80::1%eth0`
+names an interface as well as an address, and `inet` has nowhere to keep one.
+It is stored as `fe80::1`, in a column and in the blob alike, and the record
+in your hand keeps what it was given until you read it again.
 
 **A naive `datetime` goes in and an aware one comes back.** The column is
 `timestamptz` and the session has a timezone, so the database attaches one. The
@@ -4671,9 +4703,9 @@ equality is all it says. One thing is checked here that a filter is spared — a
 value outside the field's `choices` is refused, since an index over a word the
 field will not take is built and stays empty. The value is text, a whole
 number, a `Decimal`, a `date`, a `UUID`, `True` or `False`. A field in the blob
-can be named where it is one of the five kinds that can be indexed there,
-further down this section, or where the value is `None`, and is compared the
-way an index over it is:
+can be named where it is one of the kinds that can be indexed there, further
+down this section, and the value is one of those, or where the value is
+`None`, and is compared the way an index over it is:
 
 ```python
 index("family_name", where={"suburb": "Leura"})
@@ -4856,9 +4888,10 @@ that is not dray. SQL of your own
 reaches it by reading the field as that text, `data->>'suburb'`, which for a
 `str` field is what `sql_for` already writes.
 
-**Five kinds of field can be indexed there: `str`, `int`, `bool`, `date` and
-`UUID`.** Each is written into the document one way only, so its text is as
-good as its value. A `Decimal` is not — `4.5` and `4.50` are one number and two
+**Six kinds of field can be indexed there: `str`, `int`, `bool`, `date`,
+`UUID` and an address.** Each is written into the document one way only, so
+its text is as good as its value — an address in its shortest form,
+`2001:db8::5` however it was typed. A `Decimal` is not — `4.5` and `4.50` are one number and two
 texts — and nor is a `datetime`, which is one moment in as many spellings as
 there are time zones. Those are refused where the class is written, along with
 everything a column will not index either, and the answer for them is a column.

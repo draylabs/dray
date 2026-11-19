@@ -32,6 +32,7 @@ import uuid
 from collections.abc import Callable
 from datetime import date, datetime
 from decimal import Decimal
+from ipaddress import IPv4Address, IPv6Address, ip_address, ip_interface
 from typing import Any
 
 import psycopg
@@ -43,6 +44,7 @@ from dray import (
     DuplicateRecord,
     Pool,
     after_commit,
+    any_of,
     before_delete,
     child,
     clock,
@@ -1766,6 +1768,118 @@ def _numeric_size(pool: Pool, table: str) -> str:
     return (
         "numeric(18,6) rounded at six places, numeric(12,8) kept eight, and "
         f"the ceiling is {MAX_PRECISION}"
+    )
+
+
+@check("addresses")
+def _addresses(pool: Pool, table: str) -> str:
+    """That an address is an `inet` column on a cluster, and behaves as the
+    page says one does.
+
+    Local PostgreSQL has had `inet` for as long as it has had anything, so the
+    suite says how dray uses one and nothing about whether a cluster holds
+    one. That it makes the column and indexes it, as a column and as the text
+    in the document. That both families go in and come back as what they
+    were, from either side. That it sorts and compares them as addresses.
+
+    And the two things the page warns of, which are the database's own and so
+    are asked of it rather than of dray: an address with a mask is a different
+    value from the address alone and comes back as an interface, and the
+    interface a link-local address was heard on does not survive.
+    """
+
+    @record(
+        table=table,
+        collection=f"c_{RUN}_addresses",
+        indexes=[index("address"), index("seen")],
+    )
+    class Host:
+        name: str = field(default="")
+        address: IPv4Address | IPv6Address | None = field(default=None)
+        seen: IPv4Address | IPv6Address | None = field(
+            default=None, stored_in="blob"
+        )
+
+    four, six = ip_address("10.0.0.9"), ip_address("2001:db8::5")
+    scoped = ip_address("fe80::1%eth0")
+
+    with pool.store(records=[Host]) as store:
+        store.create(Host)
+        hosts = getattr(store, f"c_{RUN}_addresses")
+        hosts.add(Host(name="four", address=four, seen=four))
+        hosts.add(Host(name="six", address=six, seen=six))
+        hosts.add(Host(name="scoped", address=scoped, seen=scoped))
+
+        with store.conn.cursor() as cur:
+            cur.execute(
+                "select data_type from information_schema.columns"
+                " where table_name = %s and table_schema = current_schema()"
+                " and column_name = 'address'",
+                [table],
+            )
+            (column,) = cur.fetchone()
+            cur.execute(
+                "select %s::inet = %s::inet, %s::inet",
+                ["10.0.0.9/24", "10.0.0.9", ip_interface("10.0.0.9/24")],
+            )
+            same, masked = cur.fetchone()
+
+        def named(**question: Any) -> list[str]:
+            return sorted(r.name for r in hosts.find(**question))
+
+        back = {r.name: r for r in hosts.find()}
+        ordered = [r.name for r in hosts.find(order_by="address")]
+        answers = {
+            "a column, one": named(equals={"address": six}),
+            "a column, several": named(equals={"address": any_of(four, six)}),
+            "the blob, one": named(equals={"seen": six}),
+            "the blob, several": named(equals={"seen": any_of(four, six)}),
+            "a subnet": [
+                r.name
+                for r in hosts.select_many(
+                    f"select {hosts.columns} from {table}"
+                    " where address << '10.0.0.0/24'"
+                )
+            ],
+        }
+
+    if column != "inet":
+        raise AssertionError(f"the cluster made the column {column}, not inet")
+    for name, value in (("four", four), ("six", six)):
+        held = back[name]
+        if not (
+            held.address == held.seen == value
+            and type(held.address) is type(held.seen) is type(value)
+        ):
+            raise AssertionError(
+                f"{value!r} came back as {held.address!r} from a column and "
+                f"{held.seen!r} from the blob"
+            )
+    wanted = {
+        "a column, one": ["six"],
+        "a column, several": ["four", "six"],
+        "the blob, one": ["six"],
+        "the blob, several": ["four", "six"],
+        "a subnet": ["four"],
+    }
+    if answers != wanted:
+        raise AssertionError(f"asked by address, got {answers}, not {wanted}")
+    if ordered != ["four", "six", "scoped"]:
+        raise AssertionError(f"sorted as addresses, got {ordered}")
+    bare = ip_address("fe80::1")
+    if not back["scoped"].address == back["scoped"].seen == bare:
+        raise AssertionError(
+            f"{scoped!r} came back as {back['scoped'].address!r} from a "
+            f"column and {back['scoped'].seen!r} from the blob, not {bare!r}"
+        )
+    if same or masked != ip_interface("10.0.0.9/24"):
+        raise AssertionError(
+            "an address with a mask is no longer a value of its own: equal "
+            f"to the address alone is {same}, and it came back as {masked!r}"
+        )
+    return (
+        "inet made and indexed, both families back as themselves from a "
+        "column and the blob, a mask kept and an interface name dropped"
     )
 
 
