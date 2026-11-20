@@ -2480,6 +2480,182 @@ def _write_skew(pool: Pool, table: str) -> str:
     return "skew lands unguarded, and `for update` refuses one of the two"
 
 
+@check("rule-in-a-function")
+def _rule_in_a_function(pool: Pool, table: str) -> str:
+    """
+    A rule over several rows kept in a PL/pgSQL function, called through dray.
+
+    The page moves the read, the decision and the write of *Two people, one
+    rule* into the database and says three things local PostgreSQL cannot
+    answer for. That a cluster runs the function at all. That a `for update`
+    inside it still puts the row it read in the conflict set, so two callers
+    at once are one place taken and one refusal — which arrives at the commit
+    of the block around the call, as `CommitRefused`, where `@replaying` runs
+    the loser again to be told there is no place. And that it is fewer
+    statements than the same rule written from the client, counted here
+    rather than assumed.
+
+    The two callers are held at a barrier with the call made and the commit
+    not yet sent, so the overlap is certain rather than hoped for. The
+    function is dropped by name at the end, since the sweep drops tables.
+    """
+    function = f"{table}_take"
+
+    @record(table=table, collection=f"c_{RUN}_outings")
+    class Outing:
+        places: int = field(default=1)
+
+    @record(
+        table=f"{table}_place",
+        collection=f"c_{RUN}_places",
+        indexes=[index("outing_id")],
+    )
+    class Place:
+        outing_id: uuid.UUID
+        person_id: uuid.UUID
+
+    class Full(Exception):
+        pass
+
+    outing_names, place_names = dray.names_of(Outing), dray.names_of(Place)
+    made = f"""
+        create or replace function {function}(the_outing uuid, the_person uuid)
+        returns uuid language plpgsql as $$
+        declare
+          cap int;
+          taken int;
+          made uuid := gen_random_uuid();
+        begin
+          select places into cap from {outing_names.table}
+           where {outing_names.id} = the_outing for update;
+          select count(*) into taken from {place_names.table}
+           where outing_id = the_outing;
+          if taken >= cap then
+            raise exception 'no places left';
+          end if;
+          insert into {place_names.table}
+                 ({place_names.id}, {place_names.etag}, outing_id, person_id)
+          values (made, gen_random_uuid()::text, the_outing, the_person);
+          return made;
+        end $$
+    """
+
+    def call(store: Any, outing_id: uuid.UUID) -> uuid.UUID:
+        places = getattr(store, f"c_{RUN}_places")
+        try:
+            rows = places.select_rows(
+                f"select {function}(%s, %s) as id", [outing_id, uuid.uuid4()]
+            )
+        except psycopg.errors.RaiseException as refused:
+            raise Full() from refused
+        return rows[0]["id"]
+
+    def by_hand(store: Any, outing_id: uuid.UUID) -> None:
+        outings = getattr(store, f"c_{RUN}_outings")
+        places = getattr(store, f"c_{RUN}_places")
+        with store.transaction():
+            held = outings.select_many(
+                f"select {outings.columns} from {outings.table}"
+                f" where {outings.id} = %s for update",
+                [outing_id],
+            )[0]
+            if places.count(equals={"outing_id": outing_id}) >= held.places:
+                raise Full()
+            places.add(Place(outing_id=outing_id, person_id=uuid.uuid4()))
+
+    records = [Outing, Place]
+    with pool.store(records=records) as store:
+        store.create(Outing, Place)
+        ddl(store.conn, made)
+        try:
+            outings = getattr(store, f"c_{RUN}_outings")
+            places = getattr(store, f"c_{RUN}_places")
+            one = outings.add(Outing(places=1))
+
+            barrier = threading.Barrier(2, timeout=30)
+            attempts: dict[str, int] = {"a": 0, "b": 0}
+            outcome: dict[str, str] = {}
+
+            def racer(who: str) -> None:
+                with pool.store(records=records) as mine:
+
+                    @dray.replaying
+                    def take(mine: Any) -> None:
+                        attempts[who] += 1
+                        with mine.transaction():
+                            call(mine, one.id)
+                            if attempts[who] == 1:
+                                barrier.wait()
+
+                    try:
+                        take(mine)
+                        outcome[who] = "in"
+                    except Full:
+                        outcome[who] = "full"
+
+            threads = [
+                threading.Thread(target=racer, args=(who,)) for who in "ab"
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            taken = places.count(equals={"outing_id": one.id})
+            if sorted(outcome.values()) != ["full", "in"] or taken != 1:
+                raise AssertionError(
+                    f"two at once for one place came out {outcome} with "
+                    f"{taken} taken, after {attempts} attempts"
+                )
+            # The one refused by somebody else's schema change runs again too,
+            # so the loser ran at least twice and the count is not exact.
+            loser = next(w for w, how in outcome.items() if how == "full")
+            if attempts[loser] < 2:
+                raise AssertionError(
+                    f"the caller told no ran {attempts[loser]} time, so it "
+                    "was refused by the function and never by the commit"
+                )
+
+            # A row the function wrote is a record dray reads and saves.
+            landed = places.find(equals={"outing_id": one.id})[0]
+            landed.save()
+
+            roomy = outings.add(Outing(places=10_000))
+            with store.watching() as seen_by_hand:
+                by_hand(store, roomy.id)
+            with store.watching() as seen_called:
+                with store.transaction():
+                    call(store, roomy.id)
+
+            def timed(work: Callable) -> float:
+                took = []
+                for _ in range(9):
+                    started = time.perf_counter()
+                    work()
+                    took.append(time.perf_counter() - started)
+                return sorted(took)[4] * 1000
+
+            def called() -> None:
+                with store.transaction():
+                    call(store, roomy.id)
+
+            hand_ms = timed(lambda: by_hand(store, roomy.id))
+            call_ms = timed(called)
+        finally:
+            ddl(store.conn, f"drop function if exists {function}(uuid, uuid)")
+
+    if len(seen_called) >= len(seen_by_hand):
+        raise AssertionError(
+            f"the call was {len(seen_called)} statements and the same rule by "
+            f"hand {len(seen_by_hand)}, so the page's reason for it is gone"
+        )
+    return (
+        f"one in and one told no after {attempts[loser]} runs; "
+        f"{len(seen_called)} statement to {len(seen_by_hand)} by hand, "
+        f"{call_ms:.0f} ms to {hand_ms:.0f}"
+    )
+
+
 @check("shared-store-refused")
 def _shared_store(pool: Pool, table: str) -> str:
     """And the other half: sharing one store across threads is refused rather

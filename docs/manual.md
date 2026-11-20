@@ -3518,6 +3518,119 @@ What the rule is still sitting in is a function, and a function is something a
 call site can be written without. *Before a record is written*, two sections
 down, is the same read and the same refusal put on the record instead.
 
+### The same rule, kept in the database
+
+`sign_up` is five trips to the database: the block opening, the read `for
+update`, the count, the insert and the commit. A cluster runs PL/pgSQL, so the
+three in the middle can be one — a function that reads, decides and writes
+where the rows are, called once.
+
+dray has no declaration for one. A function is SQL you wrote, exactly as the
+statement in *One statement instead* is, and it goes where that went: beside
+the collection, built from the names the classes own so that a rename reaches
+it.
+
+```python
+def sign_up_function() -> str:
+    """The statement that makes it. A migration runs this, and so does the
+    setup of any test that calls it."""
+    event, signup = names_of(Event), names_of(Signup)
+    return f"""
+        create or replace function sign_up(the_event uuid, the_person uuid)
+        returns uuid language plpgsql as $$
+        declare
+          cap int;
+          taken int;
+          made uuid := gen_random_uuid();
+        begin
+          select places into cap from {event.table}
+           where {event.id} = the_event for update;
+          select count(*) into taken from {signup.table}
+           where event_id = the_event;
+          if taken >= cap then
+            raise exception 'no places left';
+          end if;
+          insert into {signup.table}
+                 ({signup.id}, {signup.etag}, event_id, person_id)
+          values (made, gen_random_uuid()::text, the_event, the_person);
+          return made;
+        end $$
+    """
+
+
+@collection(of=Signup)
+class Signups(Collection):
+    def take(self, event_id: UUID, person_id: UUID) -> UUID:
+        """A place on the event for this person, or `NoPlacesLeft`."""
+        try:
+            rows = self.select_rows(
+                "select sign_up(%s, %s) as id", [event_id, person_id]
+            )
+        except psycopg.errors.RaiseException as refused:
+            raise NoPlacesLeft() from refused
+        return rows[0]["id"]
+
+
+@replaying
+def sign_up(store, event, person):
+    with store.transaction():
+        return store.signups.take(event.id, person.id)
+```
+
+Nothing about the rule has changed, including how it is kept. The `for update`
+is inside the function and reaches the same row, two callers at once are still
+one place taken and one commit refused, and the refusal still arrives at the
+block around the call — which is why the block is there, and why `@replaying`
+is on the function that opens it. Run again, the loser is told there is no
+place by the function itself.
+
+> **What DSQL is doing.** One statement inside the block where there were
+> three, measured through dray against a cluster: 85 ms for the call and 172
+> for the same rule from the client, from a machine about 30 ms away. The gap
+> is round trips, so it narrows as the application moves closer to the
+> cluster. What does not narrow is the other half — a block open for one
+> statement is a shorter window for somebody else to commit into, and on a
+> contended row that is replays not taken.
+
+**The function has taken on what dray was doing**, and the list is the one
+under *One statement instead*, with nothing left off it. No converter, no
+validator and no hook has run for the signup it wrote. Nothing was recorded.
+The key and the etag are in the `insert` because nobody else was going to
+supply them, and a field with `on_add` or a clock on it would need its value
+written there too. A function that updates a row moves that row's etag or
+leaves a guard waving people through, and a record it changed that a store has
+cached is stale until `forget` says so. What it wrote is a row like any other
+— `store.signups.by_id(made)` is a `Signup`, and saves like one.
+
+Which is the test of whether a rule belongs there. A rule that is a few
+statements over rows nothing much is declared on — a place taken, a counter
+moved, a balance checked — loses nothing by the move. A rule that needs what
+the class declares is two copies of it, one in each language, the day it moves.
+
+**Your tests have the tables and not the function.** `store.create` builds
+what the classes declare, and this is not declared anywhere dray looks. So the
+statement is a function of its own above rather than a string in a migration
+file: the migration runs it, and so does the fixture, straight after
+`store.create`. Local PostgreSQL runs the same text. It queues where a cluster
+refuses, as ever, so the suite shows the rule holding and never the replay.
+
+**Making or changing one is a schema change.** `create or replace` refuses the
+next writing commit of every session on the cluster, once, like an index
+built or a column added — so it belongs to a deployment's migration and never
+to an application starting up. It cannot share a transaction with a write.
+And a replaced body is the body for everybody at once, including the release
+that is still running beside the new one, so a function whose meaning changes
+gets a new name and the old one is dropped when nothing calls it.
+
+> **What DSQL is doing.** PL/pgSQL with pieces missing, each asked of a
+> cluster. There is no `exception` block, so a function cannot catch a refusal
+> or a clash and carry on: both reach the caller, which is where the replay
+> already was. There are no triggers, so nothing here makes a rule hold for a
+> write that did not call the function. A function cannot commit. A procedure
+> or a `do` block can, run on its own and never inside a transaction, which is
+> how `schema.promote` walks a table. And the 3,000 rows are counted inside a
+> function exactly as they are outside one.
+
 ## After a record lands
 
 `store.after_commit` is for a service function deciding in the moment. When it is

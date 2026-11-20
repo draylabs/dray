@@ -9920,3 +9920,91 @@ def test_a_key_added_and_never_checked_is_something_drift_says(store):
     ]
     store.conn.execute(validate)
     assert schema.drift(store.conn, Event) == []
+
+
+#
+# A function in the database
+#
+
+
+def test_a_rule_kept_in_a_database_function_is_reached_through_a_collection(
+    store,
+):
+    """The manual's own shape for a function: the statement that makes it is
+    built from the names the classes own, a test makes it beside the tables
+    because `store.create` knows nothing about it, and a collection method is
+    the one place that calls it. What the function wrote is a row like any
+    other — dray reads it back as a record — and what it raised arrives as
+    the driver's error for the method to turn into the domain's."""
+    from uuid import UUID, uuid4
+
+    from dray import Collection, collection
+
+    class NoPlacesLeft(Exception):
+        pass
+
+    @record(table="outing", collection="outings")
+    class Outing:
+        name: str
+        places: int = 20
+
+    @record(table="place", collection="places", indexes=[index("outing_id")])
+    class Place:
+        outing_id: UUID
+        person_id: UUID
+
+    def take_a_place_function() -> str:
+        outing, place = names_of(Outing), names_of(Place)
+        return f"""
+            create or replace function take_a_place(
+                the_outing uuid, the_person uuid
+            ) returns uuid language plpgsql as $$
+            declare
+              cap int;
+              taken int;
+              made uuid := gen_random_uuid();
+            begin
+              select places into cap from {outing.table}
+               where {outing.id} = the_outing for update;
+              select count(*) into taken from {place.table}
+               where outing_id = the_outing;
+              if taken >= cap then
+                raise exception 'no places left';
+              end if;
+              insert into {place.table}
+                     ({place.id}, {place.etag}, outing_id, person_id)
+              values (made, gen_random_uuid()::text, the_outing, the_person);
+              return made;
+            end $$
+        """
+
+    @collection(of=Place)
+    class Places(Collection):
+        def take(self, outing_id: UUID, person_id: UUID) -> UUID:
+            try:
+                rows = self.select_rows(
+                    "select take_a_place(%s, %s) as id", [outing_id, person_id]
+                )
+            except psycopg.errors.RaiseException as refused:
+                raise NoPlacesLeft() from refused
+            return rows[0]["id"]
+
+    store.create(Outing, Place)
+    store.conn.execute(take_a_place_function())
+
+    outing = store.outings.add(Outing(name="Working bee", places=2))
+    first, second = uuid4(), uuid4()
+
+    with store.transaction():
+        made = store.places.take(outing.id, first)
+    store.places.take(outing.id, second)
+
+    # A row the function wrote is a record like any other, guard and all.
+    landed = store.places.by_id(made)
+    assert landed.person_id == first
+    landed.save()
+
+    with pytest.raises(NoPlacesLeft):
+        with store.transaction():
+            store.places.take(outing.id, uuid4())
+    assert store.places.count(equals={"outing_id": outing.id}) == 2
