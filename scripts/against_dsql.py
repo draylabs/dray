@@ -1883,6 +1883,90 @@ def _addresses(pool: Pool, table: str) -> str:
     )
 
 
+@check("promotion-past-the-ceiling")
+def _promotion_past_the_ceiling(pool: Pool, table: str) -> str:
+    """
+    That `schema.promote` moves a field on a table bigger than a transaction.
+
+    Local PostgreSQL has no ceiling, so the suite says the walk reaches every
+    row and nothing about whether it was needed. Here the one `update` it
+    stands in for is tried first and has to be refused, or the walk is
+    ceremony. Then the block itself: that a cluster takes a `do` block which
+    commits as it goes, straight after the `alter` that made the column, and
+    that every row comes out with the value in the column and the key gone
+    from the document — the ones that never carried it left as they were.
+
+    A pass can be refused over the schema here, since every other check is
+    changing it at the same moment. That ends the block with the passes before
+    it landed, which is what the docstring says to expect, so it is run again
+    until it finishes and the count of those is part of the answer.
+    """
+
+    @record(table=table, collection=f"c_{RUN}_before_promotion")
+    class Before:
+        n: int = field(default=0)
+        town: str | None = field(default=None, stored_in="blob")
+
+    @record(table=table, collection=f"c_{RUN}_after_promotion")
+    class After:
+        n: int = field(default=0)
+        town: str | None = field(default=None)
+
+    rows, bare = 4500, 300
+    with pool.store(records=[Before, After]) as store:
+        store.create(Before)
+        before = getattr(store, f"c_{RUN}_before_promotion")
+        before.add_all([Before(n=n, town=f"town {n}") for n in range(rows)])
+        before.add_all([Before(n=-1) for _ in range(bare)])
+
+        conn = store.conn
+        alter, walk = schema.promote(After, "town", at_a_time=1000)
+        ddl(conn, alter)
+
+        try:
+            conn.execute(
+                f"update {table} set town = data->>'town' where data ? 'town'"
+            )
+        except psycopg.errors.ProgramLimitExceeded:
+            pass
+        else:
+            raise AssertionError(
+                f"one update over {rows} rows was taken, so the ceiling the "
+                "walk exists for is not this cluster's"
+            )
+
+        again = 0
+        while True:
+            try:
+                conn.execute(walk)
+                break
+            except psycopg.errors.SerializationFailure:
+                again += 1
+                if again > SCHEMA_ATTEMPTS:
+                    raise
+
+        (in_blob, in_column, null_column) = conn.execute(
+            f"select count(*) filter (where data ? 'town'),"
+            f" count(*) filter (where town = 'town ' || n),"
+            f" count(*) filter (where town is null) from {table}"
+        ).fetchone()
+        after = getattr(store, f"c_{RUN}_after_promotion")
+        found = after.find(equals={"town": "town 4321"})
+
+    if (in_blob, in_column, null_column) != (0, rows, bare):
+        raise AssertionError(
+            f"after the walk {in_blob} rows still carry the key, {in_column} "
+            f"of {rows} hold their value in the column and {null_column} of "
+            f"{bare} that never had one are null"
+        )
+    if [r.n for r in found] != [4321]:
+        raise AssertionError(f"a promoted value found {found!r}")
+    return (
+        f"one update refused, {rows} moved 1,000 to a pass"
+        + (f", run again {again} times" if again else "")
+    )
+
+
 @check("drift")
 def _drift(pool: Pool, table: str) -> str:
     """Asked of `information_schema` on a real cluster, and scoped to the schema

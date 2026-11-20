@@ -515,17 +515,17 @@ def _field_sql(cls: type, name: str) -> tuple[str, str]:
     return kind, shape.format(blob=cls.__dray_blob_column__, name=name)
 
 
-def promote(cls: type, *names: str) -> list[str]:
+def promote(cls: type, *names: str, at_a_time: int = 500) -> list[str]:
     """
     The statements that move a field out of the blob into a column of its own.
 
         schema.promote(Person, "suburb")
 
-    Deleting `stored_in="blob"` is the first of four steps. These are the other
-    three: add the column, copy across what the blob is holding, and drop the
-    key.
+    Deleting `stored_in="blob"` is the first of three steps. These are the
+    other two: add the column, then walk the table copying across what the
+    blob is holding and dropping the key it was held under.
 
-    The last one is the step nobody thinks of and the one that bites.
+    Dropping the key is the part nobody thinks of and the one that bites.
     `_dray_load` lets the blob override the column, so a row still carrying the
     key hydrates with the old value while `find` — reading the column now,
     correctly — cannot see it. The record says `'Leura'` and nothing can find
@@ -537,17 +537,46 @@ def promote(cls: type, *names: str) -> list[str]:
     class is the step these statements come after and doing them in the other
     order leaves a column nothing writes to.
 
-    Written to survive being run twice, like everything else here: the column is
-    added `if not exists` and both updates skip the rows that no longer carry
-    the key. Which also makes them safe to stop halfway and resume.
+    The walk is a `do` block that takes the table `at_a_time` rows to a pass,
+    in key order, and commits each pass. DSQL takes 3,000 rows to a
+    transaction, so a table of any size is that many transactions and never
+    one; a row is moved whole, so no reader finds a value in both places or in
+    neither. `at_a_time` past what a transaction holds is refused here.
 
-    What they do not do is fit. DSQL takes 3,000 rows to a transaction, so each
-    update is one transaction and a table past that has to be walked in batches
-    instead. dray is not a migration runner — these are statements to read, and
-    to put in a migration that knows how big the table is.
+    **It commits, so it runs on its own** and not inside a transaction, which
+    refuses it on either database. Send it on a connection that commits each
+    statement as it is sent — `store.conn` is one.
+
+    Written to survive being run twice, like everything else here: the column
+    is added `if not exists` and the walk passes over a row that no longer
+    carries the key. Which is also what to do when it stops. A pass that meets
+    somebody else's write to one of its rows is refused, the block ends with
+    that refusal, and the passes before it have landed — run it again and it
+    carries on.
+
+    dray is not a migration runner. These are statements to read, and to put
+    in a migration.
     """
+    from dray.collection import MAX_ROWS
+
+    if not isinstance(at_a_time, int) or isinstance(at_a_time, bool):
+        raise TypeError(f"at_a_time is a number of rows, not {at_a_time!r}")
+    if at_a_time < 1:
+        raise ValueError(
+            f"a pass takes at least one row, not {at_a_time}. A pass that "
+            "takes none is a walk that never ends."
+        )
+    if at_a_time > MAX_ROWS:
+        raise ValueError(
+            f"at_a_time={at_a_time} is more rows than one transaction holds, "
+            f"which is {MAX_ROWS}. A pass is one transaction, so no pass that "
+            "size would ever be taken — walk in more passes with fewer."
+        )
+
     table = cls.__dray_table__
     blob = cls.__dray_blob_column__
+    key = cls.__dray_key__
+    keyed = dict(_columns(cls))[key]
     written = []
 
     for name in names:
@@ -569,11 +598,62 @@ def promote(cls: type, *names: str) -> list[str]:
 
         written += [
             f"alter table {table} add column if not exists {name} {kind}",
-            f"update {table} set {name} = {held} where {blob} ? '{name}'",
-            f"update {table} set {blob} = {blob} - '{name}'"
-            f" where {blob} ? '{name}'",
+            _walk(table, key, keyed, blob, name, held, at_a_time),
         ]
     return written
+
+
+def _walk(
+    table: str,
+    key: str,
+    keyed: str,
+    blob: str,
+    name: str,
+    held: str,
+    at_a_time: int,
+) -> str:
+    """
+    One field's move, as a block that walks the table a page of keys at a time.
+
+    By key and not by `where blob ? name limit n`, which reads past every row
+    already moved to find the next ones still to go and so costs the square of
+    the table. A page here is a range of the primary key, found by stepping
+    `at_a_time` keys on from the last one, and a row inside it that does not
+    carry the key is passed over without being written.
+
+    One `update` does both halves so that a row is never caught between them.
+    Both right-hand sides read the row as it was, so the value is copied from
+    the document the same statement takes it out of.
+
+    The two variables are under dray's own prefix because a column of the
+    table can be named anything else, and PL/pgSQL refuses a name that could
+    be either. They are declared by the key's type written out rather than
+    with `%type`: this is text somebody pastes into a migration, and a percent
+    sign is a placeholder to half of what will be asked to send it.
+    """
+    after = f"(_dray_last is null or {key} > _dray_last)"
+    return (
+        "do $$\n"
+        "declare\n"
+        f"  _dray_last {keyed};\n"
+        f"  _dray_upto {keyed};\n"
+        "begin\n"
+        "  loop\n"
+        f"    select {key} into _dray_upto from {table}\n"
+        f"     where {after}\n"
+        f"     order by {key} offset {at_a_time - 1} limit 1;\n"
+        f"    update {table}\n"
+        f"       set {name} = {held},\n"
+        f"           {blob} = {blob} - '{name}'\n"
+        f"     where {blob} ? '{name}'\n"
+        f"       and {after}\n"
+        f"       and (_dray_upto is null or {key} <= _dray_upto);\n"
+        "    commit;\n"
+        "    exit when _dray_upto is null;\n"
+        "    _dray_last := _dray_upto;\n"
+        "  end loop;\n"
+        "end $$"
+    )
 
 
 def create_namespace(name: str) -> str:

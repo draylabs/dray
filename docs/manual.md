@@ -5182,29 +5182,73 @@ blob key, where `find` — now reading the column, correctly — cannot see it, 
 where `load` still lets it override the column it is supposed to have moved to.
 The record says `'Leura'` and nothing can find `'Leura'`.
 
-So it is four steps, and dray writes three of them:
+So it is three steps, and dray writes two of them:
 
 ```python
 for statement in schema.promote(Person, "suburb"):
     print(statement)
 
 # alter table person add column if not exists suburb text
-# update person set suburb = (data->>'suburb')::text where data ? 'suburb'
-# update person set data = data - 'suburb' where data ? 'suburb'
+#
+# do $$
+# declare
+#   _dray_last uuid;
+#   _dray_upto uuid;
+# begin
+#   loop
+#     select id into _dray_upto from person
+#      where (_dray_last is null or id > _dray_last)
+#      order by id offset 499 limit 1;
+#     update person
+#        set suburb = (data->>'suburb')::text,
+#            data = data - 'suburb'
+#      where data ? 'suburb'
+#        and (_dray_last is null or id > _dray_last)
+#        and (_dray_upto is null or id <= _dray_upto);
+#     commit;
+#     exit when _dray_upto is null;
+#     _dray_last := _dray_upto;
+#   end loop;
+# end $$
 ```
 
-Add the column, copy across what the blob is holding, drop the key so it stops
-shadowing. The last one is the step nobody thinks of and the one that bites.
+Add the column, then walk the table: copy across what the blob is holding and
+drop the key it was held under, so it stops shadowing. Dropping the key is the
+part nobody thinks of and the one that bites, and it is the same `update` as
+the copy, so no row is ever caught with the value in both places.
 
 Change the class first — `promote` refuses a field still declared
 `stored_in="blob"`, because running these before the class changes leaves a
-column nothing writes to. Each survives being run twice, and the two updates skip
-rows that no longer carry the key, so stopping halfway and resuming is safe.
+column nothing writes to.
+
+> **What DSQL is doing.** 3,000 rows to a transaction, so one `update` over a
+> table past that is refused whole and the promotion never starts. The block
+> takes five hundred rows to a pass, in key order, and commits each pass —
+> `at_a_time=` is the five hundred. Against a cluster, 40,000 rows moved in
+> eighty passes and about twelve seconds, and four times the rows took four
+> times as long. Local PostgreSQL runs the same block and needed none of it.
+
+**It commits, so it runs on its own.** Inside a transaction both databases
+refuse it — `invalid transaction termination` — before a row has moved. Send
+it on a connection that commits each statement as it goes, which `store.conn`
+is, and keep it out of a migration tool's own transaction.
+
+**It can stop part way, and running it again is what carries on.** A pass that
+meets somebody else's write to one of its rows is refused like any other
+commit, and nothing in the database can catch that, so the block ends there
+with the passes before it landed. Each statement survives being run twice —
+the walk passes over a row that no longer carries the key — so the answer to
+a refusal is the same block again. Walked beside a writer changing twenty rows
+at a time without pause, 20,000 rows took twenty-six runs to finish and lost
+nothing. A quiet table takes one.
+
+dray is not a migration runner and does not pretend to be one. These are
+statements to read and put in a migration.
 
 An index that named the field while it was in the blob is over the document,
 and none of these statements touch it. `schema.drift` reports the one the class
 now asks for, over the column, and `schema.create_indexes` writes it. The old
-one is yours to drop once the last of the three has run.
+one is yours to drop once the walk has finished.
 
 Where that index is unique there is a gap to plan for. A row written after the
 class changed carries nothing under the key, so the index over the document no
@@ -5217,11 +5261,6 @@ until it sees none, and then comes back as one group of nulls — nothing raises
 and `drift` compares tables to classes and never looks at a statement. Build the
 projection with `sql_for` and the statement answers the same before and after
 this runs, unedited: *Where your names live in SQL you wrote*, below.
-
-> **What DSQL is doing.** 3,000 rows to a transaction, so each of those updates
-> is one transaction and a table past that has to be walked in batches. These are
-> statements to read and put in a migration that knows how big the table is —
-> dray is not a migration runner and does not pretend to be one.
 
 ## The names dray owns
 

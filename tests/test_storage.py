@@ -137,8 +137,8 @@ def test_a_promoted_column_is_built_at_the_size_the_field_declared():
     """Promotion builds the column the class now asks for, and for a `Decimal`
     that includes how big it is. Built at the default instead, a field the class
     says keeps eight places would start rounding at six on the day it moved out
-    of the blob — where nothing is watching, because the whole point of the four
-    statements is that the values come across unchanged."""
+    of the blob — where nothing is watching, because the whole point of a
+    promotion is that the values come across unchanged."""
 
     @record(table="fee", collection="fees")
     class Fee:
@@ -330,9 +330,133 @@ def test_promotion_carries_every_type_the_blob_had_to_write_down(store):
     assert store.parcels3_after.count(equals={"cost": Decimal("4.99")}) == 1
 
 
+def test_a_promotion_walks_a_table_bigger_than_one_pass(store):
+    """DSQL takes 3,000 rows to a transaction, so one `update` over a table
+    past that is a refusal and not a promotion. The walk takes a page of keys
+    to a pass and commits each, which has to reach every row whatever the page
+    is — the last partial one included — and has to leave alone a row that
+    never carried the key, since a pass is a range of keys and not a list of
+    the rows to move."""
+
+    @record(table="boarder", collection="boarders_before")
+    class Before:
+        name: str = field()
+        town: str | None = field(default=None, stored_in="blob")
+
+    store.create(Before)
+    towns = [
+        "Leura", "Katoomba", None, "Blackheath", None, "Lawson", "Bullaburra",
+    ]
+    for n, town in enumerate(towns):
+        if town is None:
+            store.boarders_before.add(Before(name=f"b{n}"))
+        else:
+            store.boarders_before.add(Before(name=f"b{n}", town=town))
+
+    @record(table="boarder", collection="boarders_after")
+    class After:
+        name: str = field()
+        town: str | None = field(default=None)
+
+    for size in (3, 7, 8):
+        for statement in schema.promote(After, "town", at_a_time=size):
+            with store.conn.cursor() as cur:
+                cur.execute(statement)
+
+        assert {b.name: b.town for b in store.boarders_after.find()} == {
+            f"b{n}": town for n, town in enumerate(towns)
+        }
+        with store.conn.cursor() as cur:
+            cur.execute("select count(*) from boarder where data ? 'town'")
+            assert cur.fetchone()[0] == 0
+
+        # Back into the blob for the next size, the way a row written before
+        # the class changed carries it.
+        with store.conn.cursor() as cur:
+            cur.execute(
+                "update boarder set data = jsonb_build_object('town', town),"
+                " town = null where town is not null"
+            )
+
+
+def test_a_promotion_walks_by_whatever_the_key_is(store):
+    """The walk steps through the primary key, so it is written against the
+    key the class names and the type that key has — not `id`, and not a
+    `uuid`."""
+
+    @record(table="berth", collection="berths_before", key="ref")
+    class Before:
+        ref: str
+        deck: str | None = field(default=None, stored_in="blob")
+
+    store.create(Before)
+    for n in range(5):
+        store.berths_before.add(Before(ref=f"B{n}", deck=f"deck {n}"))
+
+    @record(table="berth", collection="berths_after", key="ref")
+    class After:
+        ref: str
+        deck: str | None = field(default=None)
+
+    for statement in schema.promote(After, "deck", at_a_time=2):
+        with store.conn.cursor() as cur:
+            cur.execute(statement)
+
+    assert [b.deck for b in store.berths_after.find(order_by="ref")] == [
+        f"deck {n}" for n in range(5)
+    ]
+
+
+def test_a_promotion_runs_on_its_own_and_says_so_in_a_transaction(store):
+    """The walk commits each pass, which is the only way past a ceiling that
+    counts a transaction, and a block that commits cannot run inside one. The
+    refusal is the database's, and it comes before a row has moved."""
+
+    @record(table="roomer", collection="roomers_before")
+    class Before:
+        town: str | None = field(default=None, stored_in="blob")
+
+    store.create(Before)
+    store.roomers_before.add(Before(town="Leura"))
+
+    @record(table="roomer", collection="roomers_after")
+    class After:
+        town: str | None = field(default=None)
+
+    alter, walk = schema.promote(After, "town")
+    with store.conn.cursor() as cur:
+        cur.execute(alter)
+
+    with pytest.raises(psycopg.errors.InvalidTransactionTermination):
+        with store.transaction():
+            with store.conn.cursor() as cur:
+                cur.execute(walk)
+
+    with store.conn.cursor() as cur:
+        cur.execute("select count(*) from roomer where data ? 'town'")
+        assert cur.fetchone()[0] == 1
+
+
+def test_a_pass_no_transaction_could_hold_is_refused_where_it_is_written():
+    """`at_a_time` is a number somebody wrote down, and a pass past what a
+    transaction holds would be refused by the database on its first trip out
+    with half a migration already run around it."""
+
+    @record(table="guest", collection="guests")
+    class Guest:
+        town: str | None = field(default=None)
+
+    with pytest.raises(ValueError, match="more rows than one transaction"):
+        schema.promote(Guest, "town", at_a_time=2_001)
+    with pytest.raises(ValueError, match="at least one row"):
+        schema.promote(Guest, "town", at_a_time=0)
+    with pytest.raises(TypeError, match="a number of rows"):
+        schema.promote(Guest, "town", at_a_time="500")
+
+
 def test_promoting_a_field_still_declared_in_the_blob_is_refused():
-    """The class is the first of the four steps. These statements come after
-    it, and running them before leaves a column nothing writes to."""
+    """The class is the first step. These statements come after it, and
+    running them before leaves a column nothing writes to."""
 
     @record(table="tenant", collection="tenants")
     class Tenant:
@@ -3893,11 +4017,10 @@ def test_sql_for_is_the_expression_promote_builds_for_every_type_there_is():
     outside = declared("shapes_column")
 
     for name in named:
-        # `promote`'s second statement is the backfill, and what it sets the
+        # `promote`'s second statement is the walk, and what it sets the
         # column from is the same expression a report reads the blob with.
-        backfill = schema.promote(outside, name)[1]
-        held = backfill.split(" = ", 1)[1].split(" where ")[0]
-        assert names_of(inside).sql_for(name) == held
+        walk = schema.promote(outside, name)[1]
+        assert f"set {name} = {names_of(inside).sql_for(name)},\n" in walk
 
 
 def test_a_statement_built_from_the_class_survives_the_field_being_promoted(
