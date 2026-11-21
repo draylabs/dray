@@ -240,8 +240,15 @@ def test_an_observer_on_the_pool_hears_from_every_thread(pool):
 
     watched = Pool(pool._pool, records=[Rider, RiderNote], observer=watch)
 
+    # Nobody writes until all four are running. Python hands a finished
+    # thread's ident to the next one started, so a writer quick enough to be
+    # done before the last has begun would leave four inserts under three
+    # idents, and the count below would be about the scheduler.
+    together = threading.Barrier(4, timeout=10)
+
     def work(name):
         def run():
+            together.wait()
             with watched.store() as store:
                 store.riders.add(Rider(family_name=name))
 
