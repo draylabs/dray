@@ -372,13 +372,35 @@ set(volunteers) - set(coordinators)
 What that id is, where the class declared no field for one, is a version-4
 uuid — `uuid4()`, minted in Python as the object is built, which is how the
 loop above knew every id before a row existed. Random rather than climbing, and
-that is the point of it rather than an accident of the call: on DSQL the table
-*is* the primary-key B-tree, so keys arriving in order arrive at the same end of
-it and a table taking writes in volume spends one partition's throughput on all
-of them, where scattered ones spread across the whole of it. AWS ask for a key
-that distributes for exactly that reason. It is a real cost paid for a real
-thing, and where the bill arrives is *Asking for records* below — two ids
-compare, and the comparison means nothing.
+that is a choice about what an id says rather than about speed. An id goes out
+in a link and comes back from a browser, and a random one tells whoever holds
+it nothing: not when the record was made, and not which of two was made first.
+It is a real cost paid for a real thing, and where the bill arrives is *Asking
+for records* below — two ids compare, and the comparison means nothing.
+
+Speed is not the reason, and the cluster is where that was asked. On DSQL the
+table *is* the primary-key B-tree, so keys that climb all arrive at the same
+end of it, and the worry is that a table taking writes in volume spends one
+partition's throughput on all of them. It does not show: a million rows loaded
+a thousand to a transaction went in about a tenth *faster* keyed by a
+time-ordered uuid than by a random one, and a row written on its own took the
+same time under either. So a table that is loaded in bulk, and whose ids never
+leave the building, can have a key that climbs by saying so:
+
+```python
+# `uuid7` is in Python from 3.14; any function returning a UUID does.
+from uuid import UUID, uuid7
+
+@record(table="reading", collection="readings")
+class Reading:
+    id: UUID = field(default_factory=uuid7)
+    ...
+```
+
+What that buys is the load and not an ordering to lean on. A version-7 uuid
+orders to the millisecond, by the clock of whichever machine minted it, so it
+is right about which of two came first nearly every time — which is harder to
+catch than being right half the time, not easier.
 
 An id can be given when a record is built — an import carrying its own keys, a
 record rebuilt from a backup — and cannot be moved afterwards:
